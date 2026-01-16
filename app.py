@@ -252,7 +252,7 @@ with tab_deviations:
         key=f"deviations_editor_{TEAM}_{week_iso}"
     )
 
-         if st.button("Save deviations", key=f"save_dev_{TEAM}_{week_iso}"):
+        if st.button("Save deviations", key=f"save_dev_{TEAM}_{week_iso}"):
          for _, r in edited.iterrows():
             block["deviations"][r["Person"]] = {d: r[d] for d in DAYS}
         save_json(REPORTS_FILE, reports)
