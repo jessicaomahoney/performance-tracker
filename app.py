@@ -70,14 +70,13 @@ METRICS = ["Calls", "EA Calls", "Things Done"]
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]
 
 DEVIATION_OPTIONS = ["Normal", "Half day", "Sick", "Annual leave", "Reward time", "Other"]
-
 DEVIATION_MULTIPLIER = {
     "Normal": 1.0,
     "Half day": 0.5,
     "Sick": 0.0,
     "Annual leave": 0.0,
     "Reward time": 0.0,
-    "Other": 1.0,  # we can later add custom % if needed
+    "Other": 1.0,
 }
 
 # ----------------------------
@@ -100,13 +99,6 @@ def load_index():
 def save_index(items):
     save_json(INDEX_FILE, items)
 
-def load_people():
-    default_people = ["Rebecca", "Nicole", "Sonia"]
-    return load_json(PEOPLE_FILE, default_people)
-
-def save_people(people_list):
-    save_json(PEOPLE_FILE, people_list)
-
 def load_reports():
     return load_json(REPORTS_FILE, {})
 
@@ -114,11 +106,63 @@ def save_reports(reports_dict):
     save_json(REPORTS_FILE, reports_dict)
 
 def load_baselines():
-    # Structure: { "Person": { "Calls": 150, "EA Calls": 50, "Things Done": 20 }, ... }
     return load_json(BASELINES_FILE, {})
 
 def save_baselines(b):
     save_json(BASELINES_FILE, b)
+
+# ----------------------------
+# People (Active / Archived) + migration
+# ----------------------------
+def default_people_state():
+    # Only used if PEOPLE_FILE is missing/unreadable.
+    return {"active": ["Rebecca", "Nicole", "Sonia"], "archived": []}
+
+def load_people_state():
+    raw = load_json(PEOPLE_FILE, default_people_state())
+
+    # Migration: old format was a plain list ["A","B"].
+    if isinstance(raw, list):
+        raw = {"active": raw, "archived": []}
+        save_json(PEOPLE_FILE, raw)
+
+    # Repair minimal structure if needed
+    if not isinstance(raw, dict):
+        raw = default_people_state()
+
+    raw.setdefault("active", [])
+    raw.setdefault("archived", [])
+
+    # Clean + de-dupe while preserving order
+    def clean_list(lst):
+        out = []
+        seen = set()
+        for x in lst:
+            name = str(x).strip()
+            if not name:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+        return out
+
+    raw["active"] = clean_list(raw["active"])
+    raw["archived"] = clean_list(raw["archived"])
+
+    # Ensure no overlap: active wins
+    raw["archived"] = [x for x in raw["archived"] if x not in set(raw["active"])]
+
+    return raw
+
+def save_people_state(state):
+    save_json(PEOPLE_FILE, state)
+
+def active_people():
+    return load_people_state()["active"]
+
+def archived_people():
+    return load_people_state()["archived"]
 
 # ----------------------------
 # Date helpers
@@ -145,31 +189,23 @@ def file_exists(filename: str) -> bool:
 # ----------------------------
 # Report helpers
 # ----------------------------
-def ensure_week_report_structure(reports, week_iso, people):
+def ensure_week_report_structure(reports, week_iso, master_active_people):
     """
-    Ensure the weekly report structure exists and
-    ALWAYS syncs in any new people from the master people list.
-    Never removes existing people from historical weeks.
+    Ensure the week exists.
+    Always sync in any new ACTIVE people (never removes historical people).
     """
     if week_iso not in reports:
-        reports[week_iso] = {
-            "people": list(people),
-            "metrics": {},
-            "actions": {},
-            "deviations": {}
-        }
+        reports[week_iso] = {"people": list(master_active_people), "metrics": {}, "actions": {}, "deviations": {}}
     else:
-        # 🔑 SYNC STEP: add any new people to this existing week
-        existing = reports[week_iso].get("people", [])
-        for p in people:
-            if p not in existing:
-                existing.append(p)
-        reports[week_iso]["people"] = existing
+        reports[week_iso].setdefault("people", [])
+        # sync in new ACTIVE people
+        for p in master_active_people:
+            if p not in reports[week_iso]["people"]:
+                reports[week_iso]["people"].append(p)
 
     reports[week_iso].setdefault("metrics", {})
     reports[week_iso].setdefault("actions", {})
     reports[week_iso].setdefault("deviations", {})
-
 
     for m in METRICS:
         reports[week_iso]["metrics"].setdefault(m, {})
@@ -179,20 +215,6 @@ def ensure_week_report_structure(reports, week_iso, people):
     for p in reports[week_iso]["people"]:
         reports[week_iso]["actions"].setdefault(p, "")
         reports[week_iso]["deviations"].setdefault(p, {d: "Normal" for d in DAYS})
-
-def df_from_saved_metric(metric_dict, people, default_baseline_value):
-    rows = []
-    for p in people:
-        saved = metric_dict.get(p, {"Baseline": "", **{d: "" for d in DAYS}})
-        baseline = saved.get("Baseline", "")
-        # if user hasn't set a baseline in the week table, use baselines tab value
-        if baseline == "" and default_baseline_value is not None:
-            baseline = default_baseline_value
-        row = {"Person": p, "Baseline": baseline}
-        for d in DAYS:
-            row[d] = saved.get(d, "")
-        rows.append(row)
-    return pd.DataFrame(rows)
 
 def saved_metric_from_df(df):
     out = {}
@@ -238,10 +260,10 @@ def _to_float(x):
     except Exception:
         return None
 
-def generate_weekly_report_text(team: str, week_start: date, report_block: dict) -> str:
+def generate_weekly_report_text(team: str, week_start: date, report_block: dict, display_people: list) -> str:
     week_iso = iso(week_start)
     label = week_label(week_start)
-    people = report_block.get("people", [])
+
     metrics = report_block.get("metrics", {})
     actions = report_block.get("actions", {})
     deviations = report_block.get("deviations", {})
@@ -257,7 +279,7 @@ def generate_weekly_report_text(team: str, week_start: date, report_block: dict)
     lines.append("------------------------------------------------------------")
     lines.append("")
 
-    for p in people:
+    for p in display_people:
         lines.append(f"{p}")
         lines.append("-" * len(p))
 
@@ -270,22 +292,17 @@ def generate_weekly_report_text(team: str, week_start: date, report_block: dict)
             day_parts = []
             for d in DAYS:
                 v_raw = md.get(d, "")
-                v_num = _to_float(v_raw)
                 dev = p_dev.get(d, "Normal")
                 mult = DEVIATION_MULTIPLIER.get(dev, 1.0)
 
-                # If no baseline set, just show the value.
                 if base is None:
                     day_parts.append(f"{d} - {v_raw}")
                     continue
 
                 adj = base * mult
-
-                # If exempt day (adj baseline 0), show as EXEMPT
                 if adj == 0:
                     day_parts.append(f"{d} - {v_raw}/EXEMPT ({dev})")
                 else:
-                    # show actual/adjusted baseline
                     day_parts.append(f"{d} - {v_raw}/{int(adj) if adj.is_integer() else adj:g} ({dev})")
 
             lines.append(f"{m}: " + " | ".join(day_parts))
@@ -300,11 +317,10 @@ def generate_weekly_report_text(team: str, week_start: date, report_block: dict)
 
     return "\n".join(lines)
 
-def generate_weekly_report_tsv(report_block: dict) -> str:
-    people = report_block.get("people", [])
+def generate_weekly_report_tsv(report_block: dict, display_people: list) -> str:
     metrics = report_block.get("metrics", {})
     rows = []
-    for p in people:
+    for p in display_people:
         for m in METRICS:
             md = metrics.get(m, {}).get(p, {"Baseline": "", **{d: "" for d in DAYS}})
             row = [p, m, str(md.get("Baseline", ""))] + [str(md.get(d, "")) for d in DAYS]
@@ -324,7 +340,7 @@ with st.sidebar:
         st.rerun()
 
 tab_upload, tab_baselines, tab_deviations, tab_report, tab_history = st.tabs(
-    ["✅ This week", "🎯 Baselines", "🗓️ Deviations", "📝 Weekly report", "🗂️ History"]
+    ["✅ This week", "🎯 Baselines & People", "🗓️ Deviations", "📝 Weekly report", "🗂️ History"]
 )
 
 # ----------------------------
@@ -376,50 +392,87 @@ with tab_upload:
             st.success(f"Saved {saved} file(s) for {metric}.")
             st.rerun()
 
-    st.divider()
-    st.subheader("This week’s uploads")
-
-    index = load_index()
-    this_week = week_items(index, this_week_iso)
-    if not this_week:
-        st.info("No uploads saved for this week yet.")
-    else:
-        for metric in METRICS:
-            items = metric_items(this_week, metric)
-            if not items:
-                continue
-            st.markdown(f"### {metric}")
-            for item in reversed(items):
-                img_path = UPLOADS_DIR / item["filename"]
-                if img_path.exists():
-                    st.image(str(img_path), width=900)
-            st.divider()
-
 # ----------------------------
-# Tab: Baselines (per person)
+# Tab: Baselines & People
 # ----------------------------
 with tab_baselines:
-    st.subheader("Baselines (per person)")
-    st.write("These are the default baselines used for reports. They are team-specific (North/South).")
+    st.subheader("People (Active / Archived)")
 
-    with st.expander("People list"):
-        people = load_people()
-        people_text = st.text_area("One person per line", value="\n".join(people), height=150, key="people_editor_baselines")
-        if st.button("Save people list", key="save_people_baselines"):
-            cleaned = [x.strip() for x in people_text.splitlines() if x.strip()]
-            if not cleaned:
-                st.error("People list cannot be empty.")
-            else:
-                save_people(cleaned)
-                st.success("Saved people list.")
-                st.rerun()
+    state = load_people_state()
+    active = state["active"]
+    archived = state["archived"]
 
-    people = load_people()
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("### Active")
+        st.write(active if active else "—")
+    with c2:
+        st.markdown("### Archived")
+        st.write(archived if archived else "—")
+
+    st.divider()
+
+    st.markdown("### Add a person")
+    new_name = st.text_input("Name", key="add_person_name").strip()
+    if st.button("Add to Active", use_container_width=True):
+        if not new_name:
+            st.error("Enter a name first.")
+        else:
+            if new_name in archived:
+                archived.remove(new_name)
+            if new_name not in active:
+                active.append(new_name)
+            # Keep active in name order (optional but helpful)
+            active = sorted(active, key=lambda x: x.lower())
+            save_people_state({"active": active, "archived": archived})
+            st.success(f"Added {new_name}.")
+            st.rerun()
+
+    st.divider()
+
+    st.markdown("### Archive people (remove from current views, keep history)")
+    to_archive = st.multiselect("Select active people to archive", options=active, key="archive_select")
+    if st.button("Archive selected", use_container_width=True):
+        if not to_archive:
+            st.error("Select at least one person to archive.")
+        else:
+            for p in to_archive:
+                if p in active:
+                    active.remove(p)
+                if p not in archived:
+                    archived.append(p)
+            active = sorted(active, key=lambda x: x.lower())
+            archived = sorted(archived, key=lambda x: x.lower())
+            save_people_state({"active": active, "archived": archived})
+            st.success("Archived.")
+            st.rerun()
+
+    st.divider()
+
+    st.markdown("### Restore archived people")
+    to_restore = st.multiselect("Select archived people to restore", options=archived, key="restore_select")
+    if st.button("Restore selected", use_container_width=True):
+        if not to_restore:
+            st.error("Select at least one person to restore.")
+        else:
+            for p in to_restore:
+                if p in archived:
+                    archived.remove(p)
+                if p not in active:
+                    active.append(p)
+            active = sorted(active, key=lambda x: x.lower())
+            archived = sorted(archived, key=lambda x: x.lower())
+            save_people_state({"active": active, "archived": archived})
+            st.success("Restored.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Baselines (per ACTIVE person)")
+    st.write("These baselines are team-specific (North/South). Archived people are hidden by default.")
+
     baselines = load_baselines()
-
-    # Build dataframe
     rows = []
-    for p in people:
+    for p in active:
         rows.append({
             "Person": p,
             "Calls": baselines.get(p, {}).get("Calls", ""),
@@ -427,39 +480,38 @@ with tab_baselines:
             "Things Done": baselines.get(p, {}).get("Things Done", ""),
         })
 
-    df = pd.DataFrame(rows)
+    if not rows:
+        st.info("No active people. Add someone above to set baselines.")
+    else:
+        df = pd.DataFrame(rows)
+        edited = st.data_editor(
+            df,
+            use_container_width=True,
+            num_rows="fixed",
+            hide_index=True,
+            column_config={"Person": st.column_config.TextColumn(disabled=True)},
+            key="baseline_table"
+        )
 
-    edited = st.data_editor(
-        df,
-        use_container_width=True,
-        num_rows="fixed",
-        hide_index=True,
-        column_config={
-            "Person": st.column_config.TextColumn(disabled=True),
-        },
-        key="baseline_table"
-    )
-
-    if st.button("Save baselines", use_container_width=True):
-        new_b = {}
-        for _, r in edited.iterrows():
-            p = str(r["Person"]).strip()
-            if not p:
-                continue
-            new_b[p] = {
-                "Calls": str(r.get("Calls", "")).strip(),
-                "EA Calls": str(r.get("EA Calls", "")).strip(),
-                "Things Done": str(r.get("Things Done", "")).strip(),
-            }
-        save_baselines(new_b)
-        st.success("Saved baselines.")
+        if st.button("Save baselines", use_container_width=True):
+            new_b = load_baselines()  # preserve baselines for archived/historical names
+            for _, r in edited.iterrows():
+                p = str(r["Person"]).strip()
+                if not p:
+                    continue
+                new_b[p] = {
+                    "Calls": str(r.get("Calls", "")).strip(),
+                    "EA Calls": str(r.get("EA Calls", "")).strip(),
+                    "Things Done": str(r.get("Things Done", "")).strip(),
+                }
+            save_baselines(new_b)
+            st.success("Saved baselines.")
 
 # ----------------------------
-# Tab: Deviations (per week, per person, per day)
+# Tab: Deviations
 # ----------------------------
 with tab_deviations:
     st.subheader("Deviations (sick day / half day / reward time etc.)")
-    st.write("These adjust the *daily baseline* for fairness. They do not change the actual numbers you enter.")
 
     default_week = monday_of(date.today())
     dev_week = st.date_input("Week starting (Monday)", value=default_week, key="dev_week")
@@ -467,39 +519,57 @@ with tab_deviations:
     dev_week_iso = iso(dev_week)
     st.caption(f"Selected week: **{week_label(dev_week)}**")
 
-    people = load_people()
+    state = load_people_state()
+    active = state["active"]
+    archived = state["archived"]
+
+    show_archived = st.checkbox("Show archived people", value=False, key="dev_show_archived")
+
     reports = load_reports()
-    ensure_week_report_structure(reports, dev_week_iso, people)
+    ensure_week_report_structure(reports, dev_week_iso, active)
     save_reports(reports)
 
     block = load_reports()[dev_week_iso]
-    dev_df = deviations_df_from_saved(block.get("deviations", {}), block["people"])
+    # People stored for that week (history)
+    week_people_all = block.get("people", [])
+    # People displayed
+    display_people = week_people_all if show_archived else [p for p in week_people_all if p in set(active)]
 
-    edited_dev = st.data_editor(
-        dev_df,
-        use_container_width=True,
-        num_rows="fixed",
-        hide_index=True,
-        column_config={
-            "Person": st.column_config.TextColumn(disabled=True),
-            "Mon": st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS),
-            "Tue": st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS),
-            "Wed": st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS),
-            "Thu": st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS),
-            "Fri": st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS),
-        },
-        key=f"dev_table_{dev_week_iso}"
-    )
+    if not display_people:
+        st.info("No active people to show for this week. Add/restore people in Baselines & People.")
+    else:
+        dev_df = deviations_df_from_saved(block.get("deviations", {}), display_people)
 
-    if st.button("Save deviations", use_container_width=True):
-        reports = load_reports()
-        ensure_week_report_structure(reports, dev_week_iso, load_people())
-        reports[dev_week_iso]["deviations"] = deviations_from_df(edited_dev)
-        save_reports(reports)
-        st.success("Saved deviations.")
+        edited_dev = st.data_editor(
+            dev_df,
+            use_container_width=True,
+            num_rows="fixed",
+            hide_index=True,
+            column_config={
+                "Person": st.column_config.TextColumn(disabled=True),
+                "Mon": st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS),
+                "Tue": st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS),
+                "Wed": st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS),
+                "Thu": st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS),
+                "Fri": st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS),
+            },
+            key=f"dev_table_{dev_week_iso}_{'all' if show_archived else 'active'}"
+        )
+
+        if st.button("Save deviations", use_container_width=True):
+            reports = load_reports()
+            ensure_week_report_structure(reports, dev_week_iso, active)
+            # merge deviations for displayed people back into stored deviations
+            stored = reports[dev_week_iso].get("deviations", {})
+            update = deviations_from_df(edited_dev)
+            for p, dmap in update.items():
+                stored[p] = dmap
+            reports[dev_week_iso]["deviations"] = stored
+            save_reports(reports)
+            st.success("Saved deviations.")
 
 # ----------------------------
-# Tab: Weekly report (per person)
+# Tab: Weekly report
 # ----------------------------
 with tab_report:
     st.subheader("Weekly report builder (per person)")
@@ -510,37 +580,48 @@ with tab_report:
     report_week_iso = iso(report_week)
     st.caption(f"Selected week: **{week_label(report_week)}**")
 
-    people = load_people()
+    state = load_people_state()
+    active = state["active"]
+    show_archived = st.checkbox("Show archived people", value=False, key="report_show_archived")
+
     baselines = load_baselines()
 
     reports = load_reports()
-    ensure_week_report_structure(reports, report_week_iso, people)
+    ensure_week_report_structure(reports, report_week_iso, active)
     save_reports(reports)
 
+    reports = load_reports()
+    block = reports[report_week_iso]
+    week_people_all = block.get("people", [])
+    display_people = week_people_all if show_archived else [p for p in week_people_all if p in set(active)]
+
+    if not display_people:
+        st.info("No active people to show. Add/restore people in Baselines & People.")
+        st.stop()
+
     st.divider()
-    st.write("Enter daily actuals. Baseline will auto-fill from the Baselines tab (you can override per week if needed).")
+    st.write("Enter daily actuals. Baseline auto-fills from Baselines & People (you can override per week).")
 
     for metric in METRICS:
         st.markdown(f"### {metric}")
+
         reports = load_reports()
         block = reports[report_week_iso]
-
-        # Default baseline value per person for this metric
         metric_dict = block["metrics"].get(metric, {})
+
         rows = []
-        for p in block["people"]:
+        for p in display_people:
             saved = metric_dict.get(p, {"Baseline": "", **{d: "" for d in DAYS}})
             default_b = baselines.get(p, {}).get(metric, "")
-            df_row = {"Person": p}
 
             baseline = saved.get("Baseline", "")
             if baseline == "" and default_b != "":
                 baseline = default_b
 
-            df_row["Baseline"] = baseline
+            row = {"Person": p, "Baseline": baseline}
             for d in DAYS:
-                df_row[d] = saved.get(d, "")
-            rows.append(df_row)
+                row[d] = saved.get(d, "")
+            rows.append(row)
 
         df = pd.DataFrame(rows)
 
@@ -550,13 +631,17 @@ with tab_report:
             num_rows="fixed",
             hide_index=True,
             column_config={"Person": st.column_config.TextColumn(disabled=True)},
-            key=f"editor_{metric}_{report_week_iso}"
+            key=f"editor_{metric}_{report_week_iso}_{'all' if show_archived else 'active'}"
         )
 
-        if st.button(f"Save {metric}", key=f"save_{metric}_{report_week_iso}"):
+        if st.button(f"Save {metric}", key=f"save_{metric}_{report_week_iso}_{'all' if show_archived else 'active'}"):
             reports = load_reports()
-            ensure_week_report_structure(reports, report_week_iso, load_people())
-            reports[report_week_iso]["metrics"][metric] = saved_metric_from_df(edited)
+            ensure_week_report_structure(reports, report_week_iso, active)
+            stored = reports[report_week_iso]["metrics"].get(metric, {})
+            update = saved_metric_from_df(edited)
+            for p, pdata in update.items():
+                stored[p] = pdata
+            reports[report_week_iso]["metrics"][metric] = stored
             save_reports(reports)
             st.success(f"Saved {metric}.")
             st.rerun()
@@ -564,23 +649,26 @@ with tab_report:
         st.divider()
 
     st.subheader("TL actions (required)")
+
     reports = load_reports()
-    ensure_week_report_structure(reports, report_week_iso, load_people())
+    ensure_week_report_structure(reports, report_week_iso, active)
     block = reports[report_week_iso]
 
-    for p in block["people"]:
+    for p in display_people:
         block["actions"][p] = st.text_area(
             f"{p} — TL action",
             value=block["actions"].get(p, ""),
             height=100,
-            key=f"action_{p}_{report_week_iso}"
+            key=f"action_{p}_{report_week_iso}_{'all' if show_archived else 'active'}"
         )
 
     if st.button("Save TL actions"):
         reports = load_reports()
-        ensure_week_report_structure(reports, report_week_iso, load_people())
-        for p in reports[report_week_iso]["people"]:
-            reports[report_week_iso]["actions"][p] = st.session_state.get(f"action_{p}_{report_week_iso}", "")
+        ensure_week_report_structure(reports, report_week_iso, active)
+        for p in display_people:
+            reports[report_week_iso]["actions"][p] = st.session_state.get(
+                f"action_{p}_{report_week_iso}_{'all' if show_archived else 'active'}", ""
+            )
         save_reports(reports)
         st.success("Saved TL actions.")
 
@@ -589,8 +677,8 @@ with tab_report:
     reports = load_reports()
     block = reports[report_week_iso]
 
-    report_txt = generate_weekly_report_text(TEAM, report_week, block)
-    report_tsv = generate_weekly_report_tsv(block)
+    report_txt = generate_weekly_report_text(TEAM, report_week, block, display_people)
+    report_tsv = generate_weekly_report_tsv(block, display_people)
 
     st.subheader("Downloads")
     st.download_button(
