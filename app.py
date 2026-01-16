@@ -1182,4 +1182,68 @@ with tab_backup:
     with c2:
         b = build_team_backup("South")
         st.download_button(
-            "Download SOUTH b
+            "Download SOUTH backup.json",
+            data=json.dumps(b, indent=2).encode("utf-8"),
+            file_name="south_backup.json",
+            mime="application/json",
+            use_container_width=True,
+            key="dl_backup_south"
+        )
+    with c3:
+        b = build_team_backup(TEAM)
+        st.download_button(
+            f"Download CURRENT ({TEAM}) backup.json",
+            data=json.dumps(b, indent=2).encode("utf-8"),
+            file_name=f"{TEAM.lower()}_backup.json",
+            mime="application/json",
+            use_container_width=True,
+            key="dl_backup_current"
+        )
+
+    st.caption("Note: backup does not include uploaded image files (only the index/metadata).")
+
+    st.divider()
+    st.markdown("### Restore from backup JSON (overwrites saved data)")
+    up = st.file_uploader("Upload backup JSON", type=["json"], key="restore_upload")
+    target_team = st.radio("Restore into team", ["North", "South"], horizontal=True, key="restore_target_team")
+
+    if st.button("Restore NOW (overwrite)", use_container_width=True, key="restore_now_btn"):
+        if not up:
+            st.error("Upload a backup JSON first.")
+        else:
+            try:
+                data = json.loads(up.getvalue().decode("utf-8"))
+                restore_team_backup(data, target_team)
+                mark_dirty("restored from backup")
+                st.success(f"Restored backup into {target_team}.")
+                st.info("Switch team (sidebar) to view it.")
+            except Exception as e:
+                st.error(f"Restore failed: {e}")
+
+    st.divider()
+    st.markdown("### Manual exports (CSV) for Google Sheets")
+    c4, c5 = st.columns(2)
+    with c4:
+        st.download_button(
+            "Export People CSV (this team)",
+            data=export_people_csv(TEAM),
+            file_name=f"{TEAM.lower()}_people.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="exp_people_team"
+        )
+    with c5:
+        st.download_button(
+            "Export Baselines CSV (this team)",
+            data=export_baselines_csv(TEAM),
+            file_name=f"{TEAM.lower()}_baselines.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="exp_baselines_team"
+        )
+
+    st.divider()
+    st.markdown("### Mark as backed up")
+    if st.button("I’ve backed up now", use_container_width=True, key="clear_dirty_btn"):
+        clear_dirty()
+        st.success("Backup reminder cleared.")
