@@ -441,7 +441,7 @@ with tab_baselines:
                     "Things Done": str(r.get("Things Done", "")).strip(),
                 }
             save_baselines(new_b)
-            st.success("Saved baselines.")
+          st.success("Saved baselines.")
 
     st.divider()
 
@@ -517,7 +517,7 @@ with tab_baselines:
                 save_people_state({"active": active, "archived": archived})
                 st.success("Restored.")
                 st.rerun()
-success("Saved baselines.")
+st.success("Saved baselines.")
 
 # ----------------------------
 # Tab: Deviations
