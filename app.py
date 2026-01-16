@@ -248,7 +248,7 @@ with tab_deviations:
         column_config={
             "Person": st.column_config.TextColumn(disabled=True),
             **{d: st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS) for d in DAYS}
-        }
+        },
         key=f"deviations_editor_{TEAM}_{week_iso}"
     )
 
