@@ -146,21 +146,30 @@ def file_exists(filename: str) -> bool:
 # Report helpers
 # ----------------------------
 def ensure_week_report_structure(reports, week_iso, people):
-    # reports[week_iso] = {
-    #   "people": [...],
-    #   "metrics": { metric: { person: {Baseline, Mon..Fri} } },
-    #   "actions": { person: "..." },
-    #   "deviations": { person: {Mon..Fri: "Normal"...} }
-    # }
+    """
+    Ensure the weekly report structure exists and
+    ALWAYS syncs in any new people from the master people list.
+    Never removes existing people from historical weeks.
+    """
     if week_iso not in reports:
-        reports[week_iso] = {"people": people, "metrics": {}, "actions": {}, "deviations": {}}
-
-    if "people" not in reports[week_iso] or not isinstance(reports[week_iso]["people"], list):
-        reports[week_iso]["people"] = people
+        reports[week_iso] = {
+            "people": list(people),
+            "metrics": {},
+            "actions": {},
+            "deviations": {}
+        }
+    else:
+        # 🔑 SYNC STEP: add any new people to this existing week
+        existing = reports[week_iso].get("people", [])
+        for p in people:
+            if p not in existing:
+                existing.append(p)
+        reports[week_iso]["people"] = existing
 
     reports[week_iso].setdefault("metrics", {})
     reports[week_iso].setdefault("actions", {})
     reports[week_iso].setdefault("deviations", {})
+
 
     for m in METRICS:
         reports[week_iso]["metrics"].setdefault(m, {})
