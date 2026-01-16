@@ -177,10 +177,10 @@ with tab_baselines:
             df,
             hide_index=True,
             use_container_width=True,
-            column_config={"Person": st.column_config.TextColumn(disabled=True)}
+            column_config={"Person": st.column_config.TextColumn(disabled=True)},
+             key=f"baselines_editor_{TEAM}"
         )
-
-        if st.button("Save baselines"):
+        if st.button("Save baselines", key=f"save_baselines_{TEAM}"):
             for _, r in edited.iterrows():
                 baselines[r["Person"]] = {
                     "Calls": r["Calls"],
@@ -249,9 +249,10 @@ with tab_deviations:
             "Person": st.column_config.TextColumn(disabled=True),
             **{d: st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS) for d in DAYS}
         }
+        key=f"deviations_editor_{TEAM}_{week_iso}"
     )
 
-    if st.button("Save deviations"):
+ if st.button("Save deviations", key=f"save_dev_{TEAM}_{week_iso}"):
         for _, r in edited.iterrows():
             block["deviations"][r["Person"]] = {d: r[d] for d in DAYS}
         save_json(REPORTS_FILE, reports)
@@ -292,9 +293,10 @@ with tab_report:
             hide_index=True,
             use_container_width=True,
             column_config={"Person": st.column_config.TextColumn(disabled=True)}
+            key=f"report_editor_{TEAM}_{week_iso}_{metric}"
         )
 
-        if st.button(f"Save {metric}"):
+        if st.button(f"Save {metric}"key=f"save_{TEAM}_{week_iso}_{metric}")):
             for _, r in edited.iterrows():
                 block["metrics"][metric][r["Person"]] = {
                     "Baseline": r["Baseline"],
