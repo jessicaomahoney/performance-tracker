@@ -5,3 +5,5 @@ pillow
 opencv-python-headless
 easyocr
 rapidfuzz
+gspread
+google-auth
