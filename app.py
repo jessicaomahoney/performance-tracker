@@ -3,7 +3,7 @@ from datetime import date
 from pathlib import Path
 import json
 
-APP_PASSWORD = "password"  # <- change this to your real password
+APP_PASSWORD = st.secrets["APP_PASSWORD"]
 
 def check_password():
     if "authenticated" not in st.session_state:
