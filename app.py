@@ -38,7 +38,7 @@ EXEMPT_DEVIATIONS = {"Sick", "Annual leave", "Reward time"}
 # Password (Streamlit secrets if available)
 APP_PASSWORD = st.secrets["APP_PASSWORD"] if "APP_PASSWORD" in st.secrets else "password"
 
-# Links (you already set these)
+# Links
 TRACKER_SHEET_URL = "https://docs.google.com/spreadsheets/d/1t3IvVgIrqC8P9Txca5fZM96rBLvWA6NGu1yb-HD4qHM/edit?gid=0#gid=0"
 BACKUP_FOLDER_URL = "https://drive.google.com/drive/folders/1GdvL_eUJK9ShiSr3yD-O1A8HFAYyXBC-"
 
@@ -46,19 +46,20 @@ BACKUP_FOLDER_URL = "https://drive.google.com/drive/folders/1GdvL_eUJK9ShiSr3yD-
 DEFAULT_MAX_OCR_WIDTH = 1600
 DEFAULT_COLOR_DIST_THRESHOLD = 120
 
-# Default order for the small-multiples screenshots you showed (Ben -> Vanessa)
-DEFAULT_SMALL_MULTIPLES_ORDER = [
+# Small multiples: default ordered list (you can edit in the UI any time)
+DEFAULT_SMALL_MULTIPLES_ORDER_NORTH = [
     "Ben Morton",
     "Hanah Marzook",
-    "Jessica O’Mahoney",
+    "Jessica O'Mahoney",
     "Mark Williamson",
     "Melissa Hawkey",
     "Mohammed Shahbaz",
     "Rebecca Oldridge",
     "Sara Zahid",
     "Siobhan Arnel",
-    "Vanessa O’Reilly",
+    "Vanessa O'Reilly",
 ]
+DEFAULT_SMALL_MULTIPLES_ORDER_SOUTH = []  # optional, UI will auto-fill from active people if empty
 
 # =========================================================
 # HELPERS
@@ -115,6 +116,46 @@ def clear_dirty():
     st.session_state["dirty"] = False
     st.session_state["dirty_reason"] = ""
 
+def _norm_name(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.replace("’", "'")
+    s = re.sub(r"[^a-z0-9\s']", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def build_name_map(extracted_people, target_people, min_score=85):
+    """
+    Map extracted names (from OCR) onto the names in your week table.
+    Returns dict: extracted_name -> target_name
+    """
+    mapping = {}
+    target_norm = {p: _norm_name(p) for p in target_people}
+
+    for ep in extracted_people:
+        epn = _norm_name(ep)
+        best_p, best_score = None, 0
+        for tp, tpn in target_norm.items():
+            score = fuzz.token_set_ratio(epn, tpn)
+            if score > best_score:
+                best_score = score
+                best_p = tp
+        if best_p and best_score >= min_score:
+            mapping[ep] = best_p
+    return mapping
+
+def parse_order_text(text: str) -> list:
+    lines = [x.strip() for x in (text or "").splitlines()]
+    lines = [x for x in lines if x]
+    # de-dupe preserving order
+    out, seen = [], set()
+    for x in lines:
+        key = _norm_name(x)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(x)
+    return out
+
 # =========================================================
 # OCR + EXTRACTION (BETA)
 # =========================================================
@@ -134,19 +175,9 @@ def _avg_color(img_bgr, x, y, r=6):
 def _color_distance(c1, c2):
     return float(np.linalg.norm(c1 - c2))
 
-def extract_stacked_chart_to_monfri(
-    image_bytes,
-    known_people,
-    max_w=DEFAULT_MAX_OCR_WIDTH,
-    color_dist_threshold=DEFAULT_COLOR_DIST_THRESHOLD
-):
+def extract_stacked_chart_to_monfri(image_bytes, known_people, max_w=DEFAULT_MAX_OCR_WIDTH, color_dist_threshold=DEFAULT_COLOR_DIST_THRESHOLD):
     """
-    Strict extractor (stacked chart):
-    - Detects 5 date labels along x-axis (e.g., Jan 5 ...), sorts left->right,
-      maps them to Mon..Fri by position.
-    - Detects legend names and dot colours (fuzzy match against known_people).
-    - Detects numeric labels inside bars and assigns to a person by colour match.
-
+    Legacy stacked chart extractor (colour + legend).
     Returns:
       out: { "Mon": {"Person": 12, ...}, ... }
       debug: dict
@@ -162,7 +193,6 @@ def extract_stacked_chart_to_monfri(
     img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
     blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.0)
     sharp = cv2.addWeighted(gray, 1.6, blur, -0.6, 0)
     sharp = cv2.equalizeHist(sharp)
@@ -269,30 +299,20 @@ def extract_stacked_chart_to_monfri(
     }
     return out, debug
 
-def extract_small_multiples_by_order(image_bytes, ordered_people, days=DAYS, upscale=1.7):
+def extract_small_multiples_by_order(image_bytes, ordered_people, days=DAYS):
     """
-    Extractor for 'small multiples' layout:
-    - Each person has their own mini chart
-    - Values are inside bars
-    - Axis labels include Jan 5..Jan 9, which would otherwise create false digits (5/6/7/8/9)
-
-    Strategy:
-    1) OCR whole image
-    2) Find "Jan" axis label y-position (median)
-    3) For each person name, define a region below their name and ABOVE the axis labels
-    4) Collect numeric OCR tokens in that region, sort left->right, take first 5 -> Mon..Fri
-
-    Returns:
-      out: {Mon:{person:val}, ...}
-      debug: dict
+    Small multiples extractor (recommended):
+    - Each person has a mini-chart with values inside bars
+    - We find the person's name, then read up to 5 numbers just below it
+    - Assign left->right to Mon..Fri
     """
     img = Image.open(BytesIO(image_bytes)).convert("RGB")
 
     img_np = np.array(img)
     img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-    # Upscale helps a lot with blurry screenshots
-    img_bgr = cv2.resize(img_bgr, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_CUBIC)
+    # Upscale for OCR (helps with tiny fonts)
+    img_bgr = cv2.resize(img_bgr, None, fx=1.6, fy=1.6, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.0)
@@ -306,7 +326,11 @@ def extract_small_multiples_by_order(image_bytes, ordered_people, days=DAYS, ups
     )
 
     reader = get_ocr_reader()
+
+    # OCR pass for names and general text
     ocr_all = reader.readtext(thr)
+
+    # OCR pass for digits only
     ocr_nums = reader.readtext(thr, allowlist="0123456789")
 
     def bbox_bounds(b):
@@ -314,25 +338,11 @@ def extract_small_multiples_by_order(image_bytes, ordered_people, days=DAYS, ups
         ys = [p[1] for p in b]
         return int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
 
-    # Estimate axis label y (to avoid capturing 5/6/7/8/9 from "Jan 5..")
-    axis_month_re = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$", re.I)
-    axis_candidates_y = []
-    for bbox, text, conf in ocr_all:
-        t = str(text).strip()
-        if conf < 0.30:
-            continue
-        if axis_month_re.match(t):
-            x1, y1, x2, y2 = bbox_bounds(bbox)
-            cy = int((y1 + y2) / 2)
-            axis_candidates_y.append(cy)
-
-    axis_y = int(np.median(axis_candidates_y)) if axis_candidates_y else None
-
-    # Find person title boxes
+    # Find best title hit per person
     name_hits = {}
     for bbox, text, conf in ocr_all:
         t = str(text).strip()
-        if conf < 0.30 or len(t) < 3:
+        if conf < 0.30 or len(t) < 2:
             continue
         match = process.extractOne(t, ordered_people, scorer=fuzz.partial_ratio)
         if not match:
@@ -340,77 +350,47 @@ def extract_small_multiples_by_order(image_bytes, ordered_people, days=DAYS, ups
         person, score, _ = match
         if score < 85:
             continue
-
-        x1, y1, x2, y2 = bbox_bounds(bbox)
-        cx = int((x1 + x2) / 2)
-        cy = int((y1 + y2) / 2)
-
         if person not in name_hits or conf > name_hits[person]["conf"]:
-            name_hits[person] = {"bbox": bbox, "conf": conf, "cx": cx, "cy": cy}
+            name_hits[person] = {"bbox": bbox, "conf": conf, "raw": t}
 
     out = {d: {} for d in days}
-    people_no_numbers = []
 
     for person in ordered_people:
         if person not in name_hits:
             continue
 
-        pb = name_hits[person]["bbox"]
-        x1, y1, x2, y2 = bbox_bounds(pb)
+        x1, y1, x2, y2 = bbox_bounds(name_hits[person]["bbox"])
 
-        # Region below name; generous width; limited height
-        region_left = max(0, x1 - 320)
-        region_right = min(img_bgr.shape[1], x2 + 320)
+        # Search region below name (tuned for your layout)
+        region_left = max(0, x1 - 300)
+        region_right = min(img_bgr.shape[1], x2 + 300)
         region_top = y2 + 8
-
-        # cap bottom before axis labels (prevents grabbing 5/6/7/8/9)
-        if axis_y is not None:
-            region_bottom = min(img_bgr.shape[0], axis_y - 8)
-        else:
-            region_bottom = min(img_bgr.shape[0], region_top + 220)
-
-        if region_bottom <= region_top:
-            region_bottom = min(img_bgr.shape[0], region_top + 180)
+        region_bottom = min(img_bgr.shape[0], region_top + 260)
 
         nums = []
         for bbox, text, conf in ocr_nums:
             t = str(text).strip()
             if conf < 0.25 or not t.isdigit():
                 continue
-
             nx1, ny1, nx2, ny2 = bbox_bounds(bbox)
             cx = int((nx1 + nx2) / 2)
             cy = int((ny1 + ny2) / 2)
-            h = int(ny2 - ny1)
-
-            # Ignore very tiny tokens (common for axis tick digits)
-            if h < 12:
-                continue
-
             if region_left <= cx <= region_right and region_top <= cy <= region_bottom:
                 nums.append((cx, int(t), conf))
 
         nums = sorted(nums, key=lambda x: x[0])
         vals = [v for _, v, _ in nums][:5]
 
-        if not vals:
-            people_no_numbers.append(person)
-            continue
-
         for i, d in enumerate(days):
             if i < len(vals):
                 out[d][person] = vals[i]
 
     debug = {
-        "mode": "small_multiples",
-        "axis_y_detected": axis_y,
         "people_expected": list(ordered_people),
-        "people_found_titles": sorted(list(name_hits.keys())),
-        "people_no_numbers": people_no_numbers,
+        "people_found_as_titles": sorted(list(name_hits.keys())),
+        "people_missing_titles": [p for p in ordered_people if p not in name_hits],
         "numbers_total_seen": len(ocr_nums),
-        "cells_written": sum(len(out[d]) for d in days),
-        "image_size_used": {"w": int(img_bgr.shape[1]), "h": int(img_bgr.shape[0])},
-        "upscale": upscale,
+        "cells_written_preview": sum(len(out[d]) for d in days),
     }
     return out, debug
 
@@ -618,6 +598,58 @@ def metric_items(items, metric: str):
 
 def file_exists(filename: str) -> bool:
     return (P["UPLOADS"] / filename).exists()
+
+def apply_extracted_to_week(reports: dict, week_iso: str, metric: str, extracted: dict, active_people: list,
+                            strict_unreadable: bool, known_people: list, name_map_min_score: int = 85):
+    """
+    Applies extracted dict {Day:{Person:val}} into reports[week_iso]["metrics"][metric],
+    using fuzzy name mapping so OCR names still populate the week table.
+    """
+    ensure_week_structure(reports, week_iso, active_people)
+    block = reports[week_iso]
+    metric_store = block["metrics"].get(metric, {})
+
+    # Build name mapping extracted -> week names
+    extracted_names = set()
+    for d in DAYS:
+        extracted_names |= set(extracted.get(d, {}).keys())
+
+    name_map = build_name_map(
+        extracted_people=list(extracted_names),
+        target_people=list(block["people"]),
+        min_score=name_map_min_score
+    )
+
+    wrote = 0
+    expected = len(block["people"]) * len(DAYS)
+
+    # Write confident reads
+    for day in DAYS:
+        day_map = extracted.get(day, {})
+        for extracted_person, val in day_map.items():
+            target_person = name_map.get(extracted_person)
+            if not target_person:
+                continue
+            metric_store.setdefault(target_person, {"Baseline": "", **{d: "" for d in DAYS}})
+            metric_store[target_person][day] = str(val)
+            wrote += 1
+
+    # Optional strict fill
+    if strict_unreadable:
+        for day in DAYS:
+            day_map = extracted.get(day, {})
+            for person in block["people"]:
+                if person in known_people:
+                    # if the person has no value extracted for that day
+                    # AND the cell is currently blank, fill UNREADABLE
+                    if person not in [name_map.get(ep) for ep in day_map.keys()]:
+                        metric_store.setdefault(person, {"Baseline": "", **{d: "" for d in DAYS}})
+                        if str(metric_store[person].get(day, "")).strip() == "":
+                            metric_store[person][day] = "UNREADABLE"
+
+    block["metrics"][metric] = metric_store
+    reports[week_iso] = block
+    return wrote, expected, name_map
 
 # =========================================================
 # CHECKS
@@ -882,46 +914,49 @@ with tab_uploads:
 
     st.divider()
     st.subheader("Extract & apply (beta)")
-    st.caption("By default we ONLY fill confident reads and leave the rest blank (no guessing).")
+    st.caption("Recommended: use **Small multiples** screenshots. This fills what it can read confidently.")
+
+    people_state = load_people_state()
+    known_people = people_state["active"] + people_state["archived"]
 
     extractor_mode = st.selectbox(
         "Extractor mode",
         ["Small multiples (recommended)", "Stacked chart (legacy)"],
         index=0,
-        key=f"extract_mode_{TEAM}_{w_iso}"
+        key=f"extractor_mode_{TEAM}_{w_iso}"
     )
 
-    # Controls (helps when screenshots vary)
+    if extractor_mode.startswith("Small multiples"):
+        if TEAM == "North":
+            default_order = DEFAULT_SMALL_MULTIPLES_ORDER_NORTH
+        else:
+            default_order = DEFAULT_SMALL_MULTIPLES_ORDER_SOUTH if DEFAULT_SMALL_MULTIPLES_ORDER_SOUTH else (people_state["active"] or [])
+
+        order_text = st.text_area(
+            "Order list (one per line) — must match the chart order top→bottom",
+            value="\n".join(default_order),
+            height=200,
+            key=f"order_text_{TEAM}_{w_iso}"
+        )
+        ordered_people = parse_order_text(order_text)
+        if not ordered_people:
+            st.warning("Add at least 1 name in the order list (one per line).")
+    else:
+        ordered_people = []
+
+    # Controls (stacked chart only, but shown anyway)
     c1, c2, c3 = st.columns(3)
     with c1:
-        max_w = st.selectbox("OCR max width (stacked only)", [1200, 1400, 1600, 1800], index=2, key=f"ocr_maxw_{TEAM}_{w_iso}")
+        max_w = st.selectbox("OCR max width", [1200, 1400, 1600, 1800], index=2, key=f"ocr_maxw_{TEAM}_{w_iso}")
     with c2:
-        dist_thr = st.selectbox("Colour match strictness (stacked only)", [90, 110, 120, 140], index=2, key=f"ocr_thr_{TEAM}_{w_iso}")
+        dist_thr = st.selectbox("Colour match strictness", [90, 110, 120, 140], index=2, key=f"ocr_thr_{TEAM}_{w_iso}")
     with c3:
         strict_unreadable = st.checkbox("Strict: fill blanks as UNREADABLE", value=False, key=f"strict_unreadable_{TEAM}_{w_iso}")
 
-    exclude_blank_people = st.checkbox(
-        "Small multiples: treat blank/greyed people as EXCLUDED (leave blank)",
-        value=True,
-        key=f"exclude_blank_people_{TEAM}_{w_iso}"
-    )
-
-    with st.expander("Small multiples: name order (Ben → Vanessa)", expanded=False):
-        st.caption("Only needed if names don’t match exactly. One per line, in the same order as the mini charts.")
-        default_text = "\n".join(DEFAULT_SMALL_MULTIPLES_ORDER)
-        order_text = st.text_area(
-            "Ordered people list",
-            value=default_text,
-            height=180,
-            key=f"small_mult_order_{TEAM}"
-        )
-
+    # Latest file for the selected metric
     idx = load_index()
     candidates = [x for x in idx if x.get("week_start") == w_iso and x.get("metric") == metric]
     candidates = list(reversed(candidates))
-
-    people_state = load_people_state()
-    known_people = people_state["active"] + people_state["archived"]
 
     if not candidates:
         st.info("Upload a screenshot for the selected metric first (and click Save uploads).")
@@ -936,21 +971,12 @@ with tab_uploads:
 
             if st.button("Attempt extract (preview)", use_container_width=True, key=f"extract_preview_{TEAM}_{w_iso}_{metric}"):
                 if extractor_mode.startswith("Small multiples"):
-                    ordered = [x.strip() for x in order_text.splitlines() if x.strip()]
-                    extracted, dbg = extract_small_multiples_by_order(img_path.read_bytes(), ordered)
-                    st.write("Mode:", dbg.get("mode"))
-                    st.write("People titles found:", dbg.get("people_found_titles"))
-                    st.write("People with no numbers (likely excluded/greyed):", dbg.get("people_no_numbers"))
-                    st.write("Cells written:", dbg.get("cells_written"))
-                    st.json(extracted)
-                    st.session_state["last_extracted"] = {
-                        "week_iso": w_iso,
-                        "metric": metric,
-                        "data": extracted,
-                        "dbg": dbg,
-                        "mode": "small_multiples",
-                        "ordered": ordered
-                    }
+                    extracted, dbg = extract_small_multiples_by_order(img_path.read_bytes(), ordered_people)
+                    st.write("People found as titles:", dbg.get("people_found_as_titles"))
+                    missing = dbg.get("people_missing_titles", [])
+                    if missing:
+                        st.warning(f"Missing title matches: {missing[:10]}{'...' if len(missing) > 10 else ''}")
+                    st.write("Cells written (preview):", dbg.get("cells_written_preview"))
                 else:
                     extracted, dbg = extract_stacked_chart_to_monfri(
                         img_path.read_bytes(),
@@ -960,18 +986,14 @@ with tab_uploads:
                     )
                     if "error" in dbg:
                         st.error(dbg["error"])
+                        extracted = {}
                     else:
                         st.write("Detected ticks:", dbg["ticks_detected"])
                         st.write("Detected legend names:", dbg["legend_people_detected"])
                         st.write(f"Numbers detected: {dbg['numbers_detected']} | Applied: {dbg['numbers_applied']}")
-                        st.json(extracted)
-                        st.session_state["last_extracted"] = {
-                            "week_iso": w_iso,
-                            "metric": metric,
-                            "data": extracted,
-                            "dbg": dbg,
-                            "mode": "stacked"
-                        }
+
+                st.json(extracted)
+                st.session_state["last_extracted"] = {"week_iso": w_iso, "metric": metric, "data": extracted, "mode": extractor_mode}
 
             if st.button("Apply extraction to weekly tables", use_container_width=True, key=f"extract_apply_{TEAM}_{w_iso}_{metric}"):
                 payload = st.session_state.get("last_extracted")
@@ -979,61 +1001,94 @@ with tab_uploads:
                     st.error("Run 'Attempt extract (preview)' first for this week + metric.")
                 else:
                     extracted = payload["data"]
-                    dbg = payload.get("dbg", {})
-                    mode = payload.get("mode", "stacked")
-
                     reports = load_reports()
                     people_state = load_people_state()
                     active = people_state["active"]
-                    ensure_week_structure(reports, w_iso, active)
 
-                    block = reports[w_iso]
-                    metric_store = block["metrics"].get(metric, {})
+                    wrote, expected, name_map = apply_extracted_to_week(
+                        reports=reports,
+                        week_iso=w_iso,
+                        metric=metric,
+                        extracted=extracted,
+                        active_people=active,
+                        strict_unreadable=bool(strict_unreadable),
+                        known_people=known_people,
+                        name_map_min_score=85
+                    )
 
-                    wrote = 0
-                    expected = len(block["people"]) * len(DAYS)
-
-                    # Write confident reads
-                    for day in DAYS:
-                        day_map = extracted.get(day, {})
-                        for person in block["people"]:
-                            if person in day_map:
-                                metric_store.setdefault(person, {"Baseline": "", **{d: "" for d in DAYS}})
-                                metric_store[person][day] = str(day_map[person])
-                                wrote += 1
-
-                    # Strict mode behaviour differs by mode:
-                    # - stacked: same as before
-                    # - small multiples: optionally treat blank/greyed people as excluded (leave blank)
-                    if strict_unreadable:
-                        if mode == "small_multiples" and exclude_blank_people:
-                            # Only mark UNREADABLE for people that had a visible mini-chart title AND were not blank
-                            titled = set(dbg.get("people_found_titles", []))
-                            blank = set(dbg.get("people_no_numbers", []))
-                            eligible_for_unreadable = titled - blank
-                            for day in DAYS:
-                                day_map = extracted.get(day, {})
-                                for person in block["people"]:
-                                    if person in eligible_for_unreadable and person not in day_map:
-                                        metric_store.setdefault(person, {"Baseline": "", **{d: "" for d in DAYS}})
-                                        if str(metric_store[person].get(day, "")).strip() == "":
-                                            metric_store[person][day] = "UNREADABLE"
-                        else:
-                            for day in DAYS:
-                                day_map = extracted.get(day, {})
-                                for person in block["people"]:
-                                    if person in known_people and person not in day_map:
-                                        metric_store.setdefault(person, {"Baseline": "", **{d: "" for d in DAYS}})
-                                        if str(metric_store[person].get(day, "")).strip() == "":
-                                            metric_store[person][day] = "UNREADABLE"
-
-                    block["metrics"][metric] = metric_store
-                    reports[w_iso] = block
                     save_reports(reports)
                     mark_dirty(f"extraction applied for {metric}")
 
                     pct = int(round((wrote / expected) * 100)) if expected else 0
-                    st.success(f"Applied extraction to {metric} for week {w_iso}. Filled {wrote}/{expected} cells ({pct}%). Now check Weekly report tab.")
+                    st.success(f"Applied extraction to {metric} for week {w_iso}. Filled {wrote}/{expected} cells ({pct}%).")
+                    st.info(f"Name mapping used (OCR → Week table): {name_map}")
+                    st.rerun()
+
+    st.divider()
+    st.subheader("Extract & apply ALL metrics (this week)")
+    st.caption("Uploads must exist for each metric. This runs the current extractor mode for all three metrics.")
+
+    if st.button("Run ALL metrics now", use_container_width=True, key=f"run_all_metrics_{TEAM}_{w_iso}"):
+        reports = load_reports()
+        people_state = load_people_state()
+        active = people_state["active"]
+        ensure_week_structure(reports, w_iso, active)
+
+        idx = load_index()
+        summary = {}
+        total_wrote = 0
+        total_expected = 0
+
+        for m in METRICS:
+            cand = [x for x in idx if x.get("week_start") == w_iso and x.get("metric") == m]
+            cand = list(reversed(cand))
+            if not cand:
+                summary[m] = "No upload"
+                continue
+
+            path = P["UPLOADS"] / cand[0]["filename"]
+            if not path.exists():
+                summary[m] = "File missing on disk"
+                continue
+
+            if extractor_mode.startswith("Small multiples"):
+                if not ordered_people:
+                    summary[m] = "Order list empty"
+                    continue
+                extracted, dbg = extract_small_multiples_by_order(path.read_bytes(), ordered_people)
+            else:
+                extracted, dbg = extract_stacked_chart_to_monfri(
+                    path.read_bytes(),
+                    known_people,
+                    max_w=int(max_w),
+                    color_dist_threshold=int(dist_thr)
+                )
+                if "error" in dbg:
+                    summary[m] = f"Error: {dbg['error']}"
+                    continue
+
+            wrote, expected, name_map = apply_extracted_to_week(
+                reports=reports,
+                week_iso=w_iso,
+                metric=m,
+                extracted=extracted,
+                active_people=active,
+                strict_unreadable=bool(strict_unreadable),
+                known_people=known_people,
+                name_map_min_score=85
+            )
+
+            total_wrote += wrote
+            total_expected += expected
+            summary[m] = f"Wrote {wrote}/{expected} cells"
+
+        save_reports(reports)
+        mark_dirty("all metrics extracted+applied")
+        st.success("Done. Summary:")
+        st.json(summary)
+        if total_expected:
+            st.info(f"Overall filled: {total_wrote}/{total_expected} cells ({int(round((total_wrote/total_expected)*100))}%).")
+        st.rerun()
 
 # =========================================================
 # TAB: BASELINES
@@ -1225,6 +1280,27 @@ with tab_report:
     if not display_people:
         st.info("No active people to show. Add/restore people in Baselines.")
         st.stop()
+
+    st.divider()
+    with st.expander("⚠️ Reset this week (danger zone)", expanded=False):
+        st.caption("Clears all saved numbers + TL actions for this week. (Does NOT delete uploads.)")
+        confirm = st.checkbox("I understand this will clear the week data", key=f"reset_confirm_{TEAM}_{rep_week_iso}")
+        if st.button("RESET week now", use_container_width=True, key=f"reset_week_{TEAM}_{rep_week_iso}", disabled=not confirm):
+            reports = load_reports()
+            ensure_week_structure(reports, rep_week_iso, active)
+
+            for m in METRICS:
+                for p in reports[rep_week_iso]["people"]:
+                    reports[rep_week_iso]["metrics"].setdefault(m, {})
+                    reports[rep_week_iso]["metrics"][m][p] = {"Baseline": "", **{d: "" for d in DAYS}}
+
+            for p in reports[rep_week_iso]["people"]:
+                reports[rep_week_iso]["actions"][p] = ""
+
+            save_reports(reports)
+            mark_dirty("week reset")
+            st.success("Week reset complete.")
+            st.rerun()
 
     st.divider()
     st.write("Enter daily actuals. Baseline auto-fills from Baselines (you can override per week).")
