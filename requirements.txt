@@ -1,2 +1,7 @@
 streamlit
 pandas
+numpy
+pillow
+opencv-python-headless
+easyocr
+rapidfuzz
