@@ -35,11 +35,16 @@ DEVIATION_MULT = {
 }
 EXEMPT_DEVIATIONS = {"Sick", "Annual leave", "Reward time"}
 
+# Password (Streamlit secrets if available)
 APP_PASSWORD = st.secrets["APP_PASSWORD"] if "APP_PASSWORD" in st.secrets else "password"
 
-# 🔗 Paste your links here
+# Links (you already set these)
 TRACKER_SHEET_URL = "https://docs.google.com/spreadsheets/d/1t3IvVgIrqC8P9Txca5fZM96rBLvWA6NGu1yb-HD4qHM/edit?gid=0#gid=0"
 BACKUP_FOLDER_URL = "https://drive.google.com/drive/folders/1GdvL_eUJK9ShiSr3yD-O1A8HFAYyXBC-"
+
+# OCR tuning defaults
+DEFAULT_MAX_OCR_WIDTH = 1600
+DEFAULT_COLOR_DIST_THRESHOLD = 120
 
 # =========================================================
 # HELPERS
@@ -115,7 +120,7 @@ def _avg_color(img_bgr, x, y, r=6):
 def _color_distance(c1, c2):
     return float(np.linalg.norm(c1 - c2))
 
-def extract_stacked_chart_to_monfri(image_bytes, known_people):
+def extract_stacked_chart_to_monfri(image_bytes, known_people, max_w=DEFAULT_MAX_OCR_WIDTH, color_dist_threshold=DEFAULT_COLOR_DIST_THRESHOLD):
     """
     Strict extractor (beta):
     - Detects 5 date labels along x-axis (e.g., Jan 5 ...), sorts left->right,
@@ -124,14 +129,13 @@ def extract_stacked_chart_to_monfri(image_bytes, known_people):
     - Detects numeric labels inside bars and assigns to a person by colour match.
 
     Returns:
-      out: { "Mon": {"Person": 12, ...}, "Tue": {...}, ... }
+      out: { "Mon": {"Person": 12, ...}, ... }
       debug: dict
     """
     # --- Load image
     img = Image.open(BytesIO(image_bytes)).convert("RGB")
 
-    # --- Downscale to improve OCR stability on blurry screenshots
-    max_w = 1600
+    # --- Downscale for stability on blurry/compressed screenshots
     if img.width > max_w:
         scale = max_w / float(img.width)
         new_size = (max_w, int(img.height * scale))
@@ -140,17 +144,22 @@ def extract_stacked_chart_to_monfri(image_bytes, known_people):
     img_np = np.array(img)
     img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-    # --- Preprocess for OCR: grayscale + contrast boost + adaptive threshold
+    # --- Preprocess for OCR: grayscale -> sharpen -> contrast -> threshold
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
+
+    # gentle sharpen (helps blur)
+    blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.0)
+    sharp = cv2.addWeighted(gray, 1.6, blur, -0.6, 0)
+
+    sharp = cv2.equalizeHist(sharp)
+
     thr = cv2.adaptiveThreshold(
-        gray, 255,
+        sharp, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
         31, 7
     )
 
     reader = get_ocr_reader()
-    # Use thresholded image for OCR (helps with blur)
     ocr = reader.readtext(thr)
 
     # ---- Find x-axis labels like "Jan 5"
@@ -167,9 +176,8 @@ def extract_stacked_chart_to_monfri(image_bytes, known_people):
 
     ticks = sorted(ticks, key=lambda x: x[0])
     if len(ticks) < 5:
-        return {}, {"error": f"Could not detect 5 date ticks reliably (found {len(ticks)})."}
+        return {}, {"error": f"Could not detect 5 date ticks reliably (found {len(ticks)}). Try a less cropped screenshot."}
 
-    # take the 5 left-most ticks (normally Mon–Fri)
     ticks = ticks[:5]
     tick_x = [t[0] for t in ticks]
 
@@ -192,7 +200,6 @@ def extract_stacked_chart_to_monfri(image_bytes, known_people):
         left = int(min(xs))
         cy = int(sum(ys) / 4)
 
-        # dot is usually just left of the text
         sample_x = max(0, left - 18)
         color = _avg_color(img_bgr, sample_x, cy, r=8)
         legend[person] = color
@@ -220,16 +227,14 @@ def extract_stacked_chart_to_monfri(image_bytes, known_people):
         col = _avg_color(img_bgr, cx, cy + 12, r=8)
         numeric.append((cx, cy, val, conf, col))
 
-    # Map each numeric label to nearest tick, then to Mon..Fri
     day_by_tick_index = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri"}
-    out = {d: {} for d in ["Mon", "Tue", "Wed", "Thu", "Fri"]}
+    out = {d: {} for d in DAYS}
 
+    applied = 0
     for cx, cy, val, conf, col in numeric:
-        # nearest tick index by x distance
         idx = int(np.argmin([abs(cx - tx) for tx in tick_x]))
         day = day_by_tick_index.get(idx)
 
-        # choose closest legend colour
         best_person, best_dist = None, 1e9
         for person, lcol in legend.items():
             dist = _color_distance(col, lcol)
@@ -237,17 +242,20 @@ def extract_stacked_chart_to_monfri(image_bytes, known_people):
                 best_dist = dist
                 best_person = person
 
-        # strict-ish threshold, but looser than before for blur/compression
-        if best_person is None or best_dist > 120:
+        if best_person is None or best_dist > color_dist_threshold:
             continue
 
         out[day][best_person] = val
+        applied += 1
 
     debug = {
         "ticks_detected": [t[2] for t in ticks],
         "legend_people_detected": sorted(list(legend.keys())),
         "numbers_detected": len(numeric),
+        "numbers_applied": applied,
         "image_size_used": {"w": img.width, "h": img.height},
+        "color_dist_threshold": color_dist_threshold,
+        "max_width_used": max_w,
     }
     return out, debug
 
@@ -541,6 +549,34 @@ def restore_team_backup(backup_obj: dict, target_team: str):
     save_json(tp["REPORTS"], backup_obj.get("reports", {}))
     save_json(tp["INDEX"], backup_obj.get("uploads_index", []))
 
+def export_people_csv(team: str) -> bytes:
+    b = build_team_backup(team)
+    people = b["people"]
+    rows = []
+    for p in people.get("active", []):
+        rows.append({"Team": team, "Person": p, "Status": "Active"})
+    for p in people.get("archived", []):
+        rows.append({"Team": team, "Person": p, "Status": "Archived"})
+    df = pd.DataFrame(rows)
+    return df.to_csv(index=False).encode("utf-8")
+
+def export_baselines_csv(team: str) -> bytes:
+    b = build_team_backup(team)
+    baselines = b["baselines"]
+    people = b["people"]
+    all_people = sorted(set(people.get("active", []) + people.get("archived", [])), key=lambda x: x.lower())
+    rows = []
+    for p in all_people:
+        rows.append({
+            "Team": team,
+            "Person": p,
+            "Calls": baselines.get(p, {}).get("Calls", ""),
+            "EA Calls": baselines.get(p, {}).get("EA Calls", ""),
+            "Things Done": baselines.get(p, {}).get("Things Done", ""),
+        })
+    df = pd.DataFrame(rows)
+    return df.to_csv(index=False).encode("utf-8")
+
 def export_week_wide_csv(team: str, week_iso: str) -> bytes:
     b = build_team_backup(team)
     reports = b["reports"]
@@ -691,7 +727,16 @@ with tab_uploads:
 
     st.divider()
     st.subheader("Extract & apply (beta)")
-    st.caption("Strict mode: if it can’t confidently map a number to a person/day, it writes UNREADABLE (no guessing).")
+    st.caption("By default we ONLY fill confident reads and leave the rest blank (no guessing).")
+
+    # Controls (helps when screenshots vary)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        max_w = st.selectbox("OCR max width", [1200, 1400, 1600, 1800], index=2, key=f"ocr_maxw_{TEAM}_{w_iso}")
+    with c2:
+        dist_thr = st.selectbox("Colour match strictness", [90, 110, 120, 140], index=2, key=f"ocr_thr_{TEAM}_{w_iso}")
+    with c3:
+        strict_unreadable = st.checkbox("Strict: fill blanks as UNREADABLE", value=False, key=f"strict_unreadable_{TEAM}_{w_iso}")
 
     idx = load_index()
     candidates = [x for x in idx if x.get("week_start") == w_iso and x.get("metric") == metric]
@@ -712,12 +757,18 @@ with tab_uploads:
             st.image(str(img_path), width=900)
 
             if st.button("Attempt extract (preview)", use_container_width=True, key=f"extract_preview_{TEAM}_{w_iso}_{metric}"):
-                extracted, dbg = extract_stacked_chart_to_monfri(img_path.read_bytes(), known_people)
+                extracted, dbg = extract_stacked_chart_to_monfri(
+                    img_path.read_bytes(),
+                    known_people,
+                    max_w=int(max_w),
+                    color_dist_threshold=int(dist_thr)
+                )
                 if "error" in dbg:
                     st.error(dbg["error"])
                 else:
                     st.write("Detected ticks:", dbg["ticks_detected"])
                     st.write("Detected legend names:", dbg["legend_people_detected"])
+                    st.write(f"Numbers detected: {dbg['numbers_detected']} | Applied: {dbg['numbers_applied']}")
                     st.json(extracted)
                     st.session_state["last_extracted"] = {"week_iso": w_iso, "metric": metric, "data": extracted}
 
@@ -735,26 +786,35 @@ with tab_uploads:
                     block = reports[w_iso]
                     metric_store = block["metrics"].get(metric, {})
 
+                    wrote = 0
+                    expected = len(block["people"]) * len(DAYS)
+
+                    # Write confident reads
                     for day in DAYS:
                         day_map = extracted.get(day, {})
                         for person in block["people"]:
                             if person in day_map:
                                 metric_store.setdefault(person, {"Baseline": "", **{d: "" for d in DAYS}})
                                 metric_store[person][day] = str(day_map[person])
+                                wrote += 1
 
-                    for day in DAYS:
-                        day_map = extracted.get(day, {})
-                        for person in block["people"]:
-                            if person in known_people and person not in day_map:
-                                metric_store.setdefault(person, {"Baseline": "", **{d: "" for d in DAYS}})
-                                if str(metric_store[person].get(day, "")).strip() == "":
-                                    metric_store[person][day] = "UNREADABLE"
+                    # Optionally fill the remainder as UNREADABLE (strict mode)
+                    if strict_unreadable:
+                        for day in DAYS:
+                            day_map = extracted.get(day, {})
+                            for person in block["people"]:
+                                if person in known_people and person not in day_map:
+                                    metric_store.setdefault(person, {"Baseline": "", **{d: "" for d in DAYS}})
+                                    if str(metric_store[person].get(day, "")).strip() == "":
+                                        metric_store[person][day] = "UNREADABLE"
 
                     block["metrics"][metric] = metric_store
                     reports[w_iso] = block
                     save_reports(reports)
                     mark_dirty(f"extraction applied for {metric}")
-                    st.success(f"Applied extraction to {metric} for week {w_iso}. Now check Weekly report tab.")
+
+                    pct = int(round((wrote / expected) * 100)) if expected else 0
+                    st.success(f"Applied extraction to {metric} for week {w_iso}. Filled {wrote}/{expected} cells ({pct}%). Now check Weekly report tab.")
 
 # =========================================================
 # TAB: BASELINES
@@ -1122,46 +1182,4 @@ with tab_backup:
     with c2:
         b = build_team_backup("South")
         st.download_button(
-            "Download SOUTH backup.json",
-            data=json.dumps(b, indent=2).encode("utf-8"),
-            file_name="south_backup.json",
-            mime="application/json",
-            use_container_width=True,
-            key="dl_backup_south"
-        )
-    with c3:
-        b = build_team_backup(TEAM)
-        st.download_button(
-            f"Download CURRENT ({TEAM}) backup.json",
-            data=json.dumps(b, indent=2).encode("utf-8"),
-            file_name=f"{TEAM.lower()}_backup.json",
-            mime="application/json",
-            use_container_width=True,
-            key="dl_backup_current"
-        )
-
-    st.caption("Note: backup does not include uploaded image files (only the index/metadata).")
-
-    st.divider()
-    st.markdown("### Restore from backup JSON (overwrites saved data)")
-    up = st.file_uploader("Upload backup JSON", type=["json"], key="restore_upload")
-    target_team = st.radio("Restore into team", ["North", "South"], horizontal=True, key="restore_target_team")
-
-    if st.button("Restore NOW (overwrite)", use_container_width=True, key="restore_now_btn"):
-        if not up:
-            st.error("Upload a backup JSON first.")
-        else:
-            try:
-                data = json.loads(up.getvalue().decode("utf-8"))
-                restore_team_backup(data, target_team)
-                mark_dirty("restored from backup")
-                st.success(f"Restored backup into {target_team}.")
-                st.info("Switch team (sidebar) to view it.")
-            except Exception as e:
-                st.error(f"Restore failed: {e}")
-
-    st.divider()
-    st.markdown("### Mark as backed up")
-    if st.button("I’ve backed up now", use_container_width=True, key="clear_dirty_btn"):
-        clear_dirty()
-        st.success("Backup reminder cleared.")
+            "Download SOUTH b
