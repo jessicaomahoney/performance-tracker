@@ -126,12 +126,30 @@ def extract_stacked_chart_to_monfri(image_bytes, known_people):
       out: { "Mon": {"Person": 12, ...}, ... }
       debug: dict
     """
-    img = Image.open(BytesIO(image_bytes)).convert("RGB")
-    img_np = np.array(img)
-    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+  img = Image.open(BytesIO(image_bytes)).convert("RGB")
 
-    reader = get_ocr_reader()
-    ocr = reader.readtext(img_np)
+# --- Downscale to improve OCR stability on blurry screenshots
+max_w = 1600
+if img.width > max_w:
+    scale = max_w / float(img.width)
+    new_size = (max_w, int(img.height * scale))
+    img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+img_np = np.array(img)
+img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+# --- Preprocess for OCR: grayscale + contrast boost + threshold
+gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+gray = cv2.equalizeHist(gray)
+thr = cv2.adaptiveThreshold(
+    gray, 255,
+    cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
+    31, 7
+)
+
+reader = get_ocr_reader()
+# Use thresholded image for OCR
+ocr = reader.readtext(thr)
 
     # Find x-axis labels like "Jan 5"
     date_re = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d{1,2}$", re.I)
@@ -192,7 +210,7 @@ def extract_stacked_chart_to_monfri(image_bytes, known_people):
         cx = int(sum(xs) / 4)
         cy = int(sum(ys) / 4)
         val = int(t)
-        col = _avg_color(img_bgr, cx, cy, r=6)
+        col = _avg_color(img_bgr, cx, cy + 12, r=8)
         numeric.append((cx, cy, val, conf, col))
 
     day_by_tick_index = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri"}
