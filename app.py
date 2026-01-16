@@ -117,46 +117,48 @@ def _color_distance(c1, c2):
 
 def extract_stacked_chart_to_monfri(image_bytes, known_people):
     """
-    Strict extractor:
+    Strict extractor (beta):
     - Detects 5 date labels along x-axis (e.g., Jan 5 ...), sorts left->right,
       maps them to Mon..Fri by position.
-    - Detects legend names and dot colors.
-    - Detects numeric labels inside bars and assigns by color match.
+    - Detects legend names and dot colours (fuzzy match against known_people).
+    - Detects numeric labels inside bars and assigns to a person by colour match.
+
     Returns:
-      out: { "Mon": {"Person": 12, ...}, ... }
+      out: { "Mon": {"Person": 12, ...}, "Tue": {...}, ... }
       debug: dict
     """
-img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    # --- Load image
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
 
-# --- Downscale to improve OCR stability on blurry screenshots
-max_w = 1600
-if img.width > max_w:
-    scale = max_w / float(img.width)
-    new_size = (max_w, int(img.height * scale))
-    img = img.resize(new_size, Image.Resampling.LANCZOS)
+    # --- Downscale to improve OCR stability on blurry screenshots
+    max_w = 1600
+    if img.width > max_w:
+        scale = max_w / float(img.width)
+        new_size = (max_w, int(img.height * scale))
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
 
-img_np = np.array(img)
-img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    img_np = np.array(img)
+    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-# --- Preprocess for OCR: grayscale + contrast boost + threshold
-gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-gray = cv2.equalizeHist(gray)
-thr = cv2.adaptiveThreshold(
-    gray, 255,
-    cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
-    31, 7
-)
+    # --- Preprocess for OCR: grayscale + contrast boost + adaptive threshold
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    thr = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
+        31, 7
+    )
 
-reader = get_ocr_reader()
-# Use thresholded image for OCR
-ocr = reader.readtext(thr)
+    reader = get_ocr_reader()
+    # Use thresholded image for OCR (helps with blur)
+    ocr = reader.readtext(thr)
 
-    # Find x-axis labels like "Jan 5"
+    # ---- Find x-axis labels like "Jan 5"
     date_re = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d{1,2}$", re.I)
     ticks = []
     for bbox, text, conf in ocr:
-        t = text.strip()
-        if conf >= 0.5 and date_re.match(t):
+        t = str(text).strip()
+        if conf >= 0.50 and date_re.match(t):
             xs = [p[0] for p in bbox]
             ys = [p[1] for p in bbox]
             cx = int(sum(xs) / 4)
@@ -167,14 +169,15 @@ ocr = reader.readtext(thr)
     if len(ticks) < 5:
         return {}, {"error": f"Could not detect 5 date ticks reliably (found {len(ticks)})."}
 
+    # take the 5 left-most ticks (normally Mon–Fri)
     ticks = ticks[:5]
     tick_x = [t[0] for t in ticks]
 
-    # Legend mapping
-    legend = {}
+    # ---- Legend mapping: fuzzy match names + sample dot colour just left of the name
+    legend = {}  # person -> sampled colour (BGR)
     for bbox, text, conf in ocr:
-        t = text.strip()
-        if conf < 0.45 or len(t) < 3:
+        t = str(text).strip()
+        if conf < 0.35 or len(t) < 3:
             continue
 
         match = process.extractOne(t, known_people, scorer=fuzz.partial_ratio)
@@ -189,37 +192,44 @@ ocr = reader.readtext(thr)
         left = int(min(xs))
         cy = int(sum(ys) / 4)
 
+        # dot is usually just left of the text
         sample_x = max(0, left - 18)
         color = _avg_color(img_bgr, sample_x, cy, r=8)
         legend[person] = color
 
     if not legend:
-        return {}, {"error": "Legend names could not be matched. Add full names (as shown in chart legend) into People."}
+        return {}, {"error": "Legend names could not be matched. Make sure People names match the chart legend."}
 
-    # Numeric labels
+    # ---- Numeric labels inside segments
     num_re = re.compile(r"^\d+$")
     numeric = []
     for bbox, text, conf in ocr:
-        t = text.strip()
-        if conf < 0.45:
+        t = str(text).strip()
+        if conf < 0.30:
             continue
         if not num_re.match(t):
             continue
+
         xs = [p[0] for p in bbox]
         ys = [p[1] for p in bbox]
         cx = int(sum(xs) / 4)
         cy = int(sum(ys) / 4)
         val = int(t)
+
+        # Sample BELOW the text so we don't pick up the number colour
         col = _avg_color(img_bgr, cx, cy + 12, r=8)
         numeric.append((cx, cy, val, conf, col))
 
+    # Map each numeric label to nearest tick, then to Mon..Fri
     day_by_tick_index = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri"}
-    out = {d: {} for d in DAYS}
+    out = {d: {} for d in ["Mon", "Tue", "Wed", "Thu", "Fri"]}
 
     for cx, cy, val, conf, col in numeric:
+        # nearest tick index by x distance
         idx = int(np.argmin([abs(cx - tx) for tx in tick_x]))
         day = day_by_tick_index.get(idx)
 
+        # choose closest legend colour
         best_person, best_dist = None, 1e9
         for person, lcol in legend.items():
             dist = _color_distance(col, lcol)
@@ -227,7 +237,8 @@ ocr = reader.readtext(thr)
                 best_dist = dist
                 best_person = person
 
-        if best_person is None or best_dist > 70:
+        # strict-ish threshold, but looser than before for blur/compression
+        if best_person is None or best_dist > 120:
             continue
 
         out[day][best_person] = val
@@ -236,6 +247,7 @@ ocr = reader.readtext(thr)
         "ticks_detected": [t[2] for t in ticks],
         "legend_people_detected": sorted(list(legend.keys())),
         "numbers_detected": len(numeric),
+        "image_size_used": {"w": img.width, "h": img.height},
     }
     return out, debug
 
