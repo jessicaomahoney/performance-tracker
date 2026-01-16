@@ -9,6 +9,7 @@ from PIL import Image
 import cv2
 import easyocr
 from rapidfuzz import process, fuzz
+from io import BytesIO
 
 # =========================================================
 # PAGE CONFIG (must be first Streamlit call)
