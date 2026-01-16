@@ -61,12 +61,24 @@ UPLOADS_DIR = DATA_DIR / "uploads"
 INDEX_FILE = DATA_DIR / "index.json"
 PEOPLE_FILE = DATA_DIR / "people.json"
 REPORTS_FILE = DATA_DIR / "reports.json"
+BASELINES_FILE = DATA_DIR / "baselines.json"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 METRICS = ["Calls", "EA Calls", "Things Done"]
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+
+DEVIATION_OPTIONS = ["Normal", "Half day", "Sick", "Annual leave", "Reward time", "Other"]
+
+DEVIATION_MULTIPLIER = {
+    "Normal": 1.0,
+    "Half day": 0.5,
+    "Sick": 0.0,
+    "Annual leave": 0.0,
+    "Reward time": 0.0,
+    "Other": 1.0,  # we can later add custom % if needed
+}
 
 # ----------------------------
 # Storage helpers
@@ -89,7 +101,6 @@ def save_index(items):
     save_json(INDEX_FILE, items)
 
 def load_people():
-    # Defaults can differ by team if you want
     default_people = ["Rebecca", "Nicole", "Sonia"]
     return load_json(PEOPLE_FILE, default_people)
 
@@ -101,6 +112,13 @@ def load_reports():
 
 def save_reports(reports_dict):
     save_json(REPORTS_FILE, reports_dict)
+
+def load_baselines():
+    # Structure: { "Person": { "Calls": 150, "EA Calls": 50, "Things Done": 20 }, ... }
+    return load_json(BASELINES_FILE, {})
+
+def save_baselines(b):
+    save_json(BASELINES_FILE, b)
 
 # ----------------------------
 # Date helpers
@@ -128,34 +146,40 @@ def file_exists(filename: str) -> bool:
 # Report helpers
 # ----------------------------
 def ensure_week_report_structure(reports, week_iso, people):
+    # reports[week_iso] = {
+    #   "people": [...],
+    #   "metrics": { metric: { person: {Baseline, Mon..Fri} } },
+    #   "actions": { person: "..." },
+    #   "deviations": { person: {Mon..Fri: "Normal"...} }
+    # }
     if week_iso not in reports:
-        reports[week_iso] = {"people": people, "metrics": {}, "actions": {}}
+        reports[week_iso] = {"people": people, "metrics": {}, "actions": {}, "deviations": {}}
 
     if "people" not in reports[week_iso] or not isinstance(reports[week_iso]["people"], list):
         reports[week_iso]["people"] = people
 
-    if "metrics" not in reports[week_iso]:
-        reports[week_iso]["metrics"] = {}
-
-    if "actions" not in reports[week_iso]:
-        reports[week_iso]["actions"] = {}
+    reports[week_iso].setdefault("metrics", {})
+    reports[week_iso].setdefault("actions", {})
+    reports[week_iso].setdefault("deviations", {})
 
     for m in METRICS:
-        if m not in reports[week_iso]["metrics"]:
-            reports[week_iso]["metrics"][m] = {}
+        reports[week_iso]["metrics"].setdefault(m, {})
         for p in reports[week_iso]["people"]:
-            if p not in reports[week_iso]["metrics"][m]:
-                reports[week_iso]["metrics"][m][p] = {"Baseline": "", **{d: "" for d in DAYS}}
+            reports[week_iso]["metrics"][m].setdefault(p, {"Baseline": "", **{d: "" for d in DAYS}})
 
     for p in reports[week_iso]["people"]:
-        if p not in reports[week_iso]["actions"]:
-            reports[week_iso]["actions"][p] = ""
+        reports[week_iso]["actions"].setdefault(p, "")
+        reports[week_iso]["deviations"].setdefault(p, {d: "Normal" for d in DAYS})
 
-def df_from_saved_metric(metric_dict, people):
+def df_from_saved_metric(metric_dict, people, default_baseline_value):
     rows = []
     for p in people:
         saved = metric_dict.get(p, {"Baseline": "", **{d: "" for d in DAYS}})
-        row = {"Person": p, "Baseline": saved.get("Baseline", "")}
+        baseline = saved.get("Baseline", "")
+        # if user hasn't set a baseline in the week table, use baselines tab value
+        if baseline == "" and default_baseline_value is not None:
+            baseline = default_baseline_value
+        row = {"Person": p, "Baseline": baseline}
         for d in DAYS:
             row[d] = saved.get(d, "")
         rows.append(row)
@@ -172,18 +196,53 @@ def saved_metric_from_df(df):
             out[person][d] = r.get(d, "")
     return out
 
+def deviations_df_from_saved(deviations_dict, people):
+    rows = []
+    for p in people:
+        saved = deviations_dict.get(p, {d: "Normal" for d in DAYS})
+        row = {"Person": p}
+        for d in DAYS:
+            row[d] = saved.get(d, "Normal")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+def deviations_from_df(df):
+    out = {}
+    for _, r in df.iterrows():
+        p = str(r["Person"]).strip()
+        if not p:
+            continue
+        out[p] = {}
+        for d in DAYS:
+            v = r.get(d, "Normal")
+            out[p][d] = v if v in DEVIATION_OPTIONS else "Normal"
+    return out
+
+def _to_float(x):
+    try:
+        if x is None:
+            return None
+        s = str(x).strip()
+        if s == "":
+            return None
+        return float(s)
+    except Exception:
+        return None
+
 def generate_weekly_report_text(team: str, week_start: date, report_block: dict) -> str:
     week_iso = iso(week_start)
     label = week_label(week_start)
     people = report_block.get("people", [])
     metrics = report_block.get("metrics", {})
     actions = report_block.get("actions", {})
+    deviations = report_block.get("deviations", {})
 
     lines = []
     lines.append(f"{team} — Weekly performance report — {label}")
     lines.append(f"Week start (ISO): {week_iso}")
     lines.append("")
     lines.append("This report is designed to stand alone (no spreadsheet context).")
+    lines.append("Deviations reduce daily baseline fairly (e.g., sick day = baseline 0, half day = baseline 50%).")
     lines.append("TLs: include what you will do about performance gaps below.")
     lines.append("")
     lines.append("------------------------------------------------------------")
@@ -193,25 +252,38 @@ def generate_weekly_report_text(team: str, week_start: date, report_block: dict)
         lines.append(f"{p}")
         lines.append("-" * len(p))
 
+        p_dev = deviations.get(p, {d: "Normal" for d in DAYS})
+
         for m in METRICS:
             md = metrics.get(m, {}).get(p, {"Baseline": "", **{d: "" for d in DAYS}})
-            baseline = md.get("Baseline", "")
+            base = _to_float(md.get("Baseline", ""))
+
             day_parts = []
             for d in DAYS:
-                v = md.get(d, "")
-                if v == "" and baseline == "":
-                    day_parts.append(f"{d} - ")
-                elif v == "":
-                    day_parts.append(f"{d} - /{baseline}")
-                elif baseline == "":
-                    day_parts.append(f"{d} - {v}")
+                v_raw = md.get(d, "")
+                v_num = _to_float(v_raw)
+                dev = p_dev.get(d, "Normal")
+                mult = DEVIATION_MULTIPLIER.get(dev, 1.0)
+
+                # If no baseline set, just show the value.
+                if base is None:
+                    day_parts.append(f"{d} - {v_raw}")
+                    continue
+
+                adj = base * mult
+
+                # If exempt day (adj baseline 0), show as EXEMPT
+                if adj == 0:
+                    day_parts.append(f"{d} - {v_raw}/EXEMPT ({dev})")
                 else:
-                    day_parts.append(f"{d} - {v}/{baseline}")
+                    # show actual/adjusted baseline
+                    day_parts.append(f"{d} - {v_raw}/{int(adj) if adj.is_integer() else adj:g} ({dev})")
+
             lines.append(f"{m}: " + " | ".join(day_parts))
 
-        act = (actions.get(p, "") or "").strip()
         lines.append("")
         lines.append("TL action (what I will do about it):")
+        act = (actions.get(p, "") or "").strip()
         lines.append(act if act else "[NOT FILLED IN]")
         lines.append("")
         lines.append("------------------------------------------------------------")
@@ -235,7 +307,6 @@ def generate_weekly_report_tsv(report_block: dict) -> str:
 # ----------------------------
 st.title(f"📊 Team Performance Tracker — {TEAM}")
 
-# Small “switch team” button
 with st.sidebar:
     st.subheader("Team")
     st.write(f"**{TEAM}**")
@@ -243,7 +314,9 @@ with st.sidebar:
         st.session_state.team = None
         st.rerun()
 
-tab_upload, tab_report, tab_history = st.tabs(["✅ This week", "📝 Weekly report", "🗂️ History"])
+tab_upload, tab_baselines, tab_deviations, tab_report, tab_history = st.tabs(
+    ["✅ This week", "🎯 Baselines", "🗓️ Deviations", "📝 Weekly report", "🗂️ History"]
+)
 
 # ----------------------------
 # Tab: This week (uploads)
@@ -314,6 +387,109 @@ with tab_upload:
             st.divider()
 
 # ----------------------------
+# Tab: Baselines (per person)
+# ----------------------------
+with tab_baselines:
+    st.subheader("Baselines (per person)")
+    st.write("These are the default baselines used for reports. They are team-specific (North/South).")
+
+    with st.expander("People list"):
+        people = load_people()
+        people_text = st.text_area("One person per line", value="\n".join(people), height=150, key="people_editor_baselines")
+        if st.button("Save people list", key="save_people_baselines"):
+            cleaned = [x.strip() for x in people_text.splitlines() if x.strip()]
+            if not cleaned:
+                st.error("People list cannot be empty.")
+            else:
+                save_people(cleaned)
+                st.success("Saved people list.")
+                st.rerun()
+
+    people = load_people()
+    baselines = load_baselines()
+
+    # Build dataframe
+    rows = []
+    for p in people:
+        rows.append({
+            "Person": p,
+            "Calls": baselines.get(p, {}).get("Calls", ""),
+            "EA Calls": baselines.get(p, {}).get("EA Calls", ""),
+            "Things Done": baselines.get(p, {}).get("Things Done", ""),
+        })
+
+    df = pd.DataFrame(rows)
+
+    edited = st.data_editor(
+        df,
+        use_container_width=True,
+        num_rows="fixed",
+        hide_index=True,
+        column_config={
+            "Person": st.column_config.TextColumn(disabled=True),
+        },
+        key="baseline_table"
+    )
+
+    if st.button("Save baselines", use_container_width=True):
+        new_b = {}
+        for _, r in edited.iterrows():
+            p = str(r["Person"]).strip()
+            if not p:
+                continue
+            new_b[p] = {
+                "Calls": str(r.get("Calls", "")).strip(),
+                "EA Calls": str(r.get("EA Calls", "")).strip(),
+                "Things Done": str(r.get("Things Done", "")).strip(),
+            }
+        save_baselines(new_b)
+        st.success("Saved baselines.")
+
+# ----------------------------
+# Tab: Deviations (per week, per person, per day)
+# ----------------------------
+with tab_deviations:
+    st.subheader("Deviations (sick day / half day / reward time etc.)")
+    st.write("These adjust the *daily baseline* for fairness. They do not change the actual numbers you enter.")
+
+    default_week = monday_of(date.today())
+    dev_week = st.date_input("Week starting (Monday)", value=default_week, key="dev_week")
+    dev_week = monday_of(dev_week)
+    dev_week_iso = iso(dev_week)
+    st.caption(f"Selected week: **{week_label(dev_week)}**")
+
+    people = load_people()
+    reports = load_reports()
+    ensure_week_report_structure(reports, dev_week_iso, people)
+    save_reports(reports)
+
+    block = load_reports()[dev_week_iso]
+    dev_df = deviations_df_from_saved(block.get("deviations", {}), block["people"])
+
+    edited_dev = st.data_editor(
+        dev_df,
+        use_container_width=True,
+        num_rows="fixed",
+        hide_index=True,
+        column_config={
+            "Person": st.column_config.TextColumn(disabled=True),
+            "Mon": st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS),
+            "Tue": st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS),
+            "Wed": st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS),
+            "Thu": st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS),
+            "Fri": st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS),
+        },
+        key=f"dev_table_{dev_week_iso}"
+    )
+
+    if st.button("Save deviations", use_container_width=True):
+        reports = load_reports()
+        ensure_week_report_structure(reports, dev_week_iso, load_people())
+        reports[dev_week_iso]["deviations"] = deviations_from_df(edited_dev)
+        save_reports(reports)
+        st.success("Saved deviations.")
+
+# ----------------------------
 # Tab: Weekly report (per person)
 # ----------------------------
 with tab_report:
@@ -325,31 +501,39 @@ with tab_report:
     report_week_iso = iso(report_week)
     st.caption(f"Selected week: **{week_label(report_week)}**")
 
-    with st.expander("People list (edit names used in the report)"):
-        people = load_people()
-        people_text = st.text_area("One person per line", value="\n".join(people), height=150)
-        if st.button("Save people list"):
-            cleaned = [x.strip() for x in people_text.splitlines() if x.strip()]
-            if not cleaned:
-                st.error("People list cannot be empty.")
-            else:
-                save_people(cleaned)
-                st.success("Saved people list.")
-                st.rerun()
-
     people = load_people()
+    baselines = load_baselines()
+
     reports = load_reports()
     ensure_week_report_structure(reports, report_week_iso, people)
     save_reports(reports)
 
     st.divider()
-    st.write("Enter daily actuals. Baseline is optional for now (we’ll formalise targets next).")
+    st.write("Enter daily actuals. Baseline will auto-fill from the Baselines tab (you can override per week if needed).")
 
     for metric in METRICS:
         st.markdown(f"### {metric}")
         reports = load_reports()
         block = reports[report_week_iso]
-        df = df_from_saved_metric(block["metrics"].get(metric, {}), block["people"])
+
+        # Default baseline value per person for this metric
+        metric_dict = block["metrics"].get(metric, {})
+        rows = []
+        for p in block["people"]:
+            saved = metric_dict.get(p, {"Baseline": "", **{d: "" for d in DAYS}})
+            default_b = baselines.get(p, {}).get(metric, "")
+            df_row = {"Person": p}
+
+            baseline = saved.get("Baseline", "")
+            if baseline == "" and default_b != "":
+                baseline = default_b
+
+            df_row["Baseline"] = baseline
+            for d in DAYS:
+                df_row[d] = saved.get(d, "")
+            rows.append(df_row)
+
+        df = pd.DataFrame(rows)
 
         edited = st.data_editor(
             df,
@@ -392,6 +576,7 @@ with tab_report:
         st.success("Saved TL actions.")
 
     st.divider()
+
     reports = load_reports()
     block = reports[report_week_iso]
 
