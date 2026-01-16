@@ -3,6 +3,12 @@ from datetime import date, timedelta
 from pathlib import Path
 import json
 import pandas as pd
+import re
+import numpy as np
+from PIL import Image
+import cv2
+import easyocr
+from rapidfuzz import process, fuzz
 
 # =========================================================
 # PAGE CONFIG (must be first Streamlit call)
@@ -62,6 +68,126 @@ def load_json(path: Path, default):
 
 def save_json(path: Path, obj):
     path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+# =========================================================
+# OCR + EXTRACTION (BETA)
+# =========================================================
+
+@st.cache_resource
+def get_ocr_reader():
+    return easyocr.Reader(["en"], gpu=False)
+
+def _avg_color(img_bgr, x, y, r=6):
+    h, w = img_bgr.shape[:2]
+    x1, x2 = max(0, x - r), min(w, x + r)
+    y1, y2 = max(0, y - r), min(h, y + r)
+    patch = img_bgr[y1:y2, x1:x2]
+    if patch.size == 0:
+        return np.array([0, 0, 0], dtype=np.float32)
+    return patch.reshape(-1, 3).mean(axis=0)
+
+def _color_distance(c1, c2):
+    return float(np.linalg.norm(c1 - c2))
+
+def extract_stacked_chart(image_bytes, known_people):
+    """
+    Strict extractor:
+    - reads date labels (e.g., Jan 5)
+    - reads legend names and samples their dot colours
+    - reads numbers inside segments and assigns them by colour match
+    If uncertain: skips (no guessing)
+    """
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+    reader = get_ocr_reader()
+    ocr = reader.readtext(np.array(img))  # [ (bbox, text, conf), ... ]
+
+    # Find date labels like "Jan 5"
+    date_re = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d{1,2}$", re.I)
+    dates = []
+    for bbox, text, conf in ocr:
+        t = text.strip()
+        if conf >= 0.5 and date_re.match(t):
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            cx = int(sum(xs) / 4)
+            cy = int(sum(ys) / 4)
+            dates.append((cx, cy, t.title()))
+
+    dates = sorted(dates, key=lambda x: x[0])
+    if len(dates) < 2:
+        return {}, {"error": "Could not detect date labels reliably."}
+
+    # Legend mapping: fuzzy-match names + sample dot colour just left of text
+    legend = {}  # person -> sampled colour (BGR)
+    for bbox, text, conf in ocr:
+        t = text.strip()
+        if conf < 0.45 or len(t) < 3:
+            continue
+
+        match = process.extractOne(t, known_people, scorer=fuzz.partial_ratio)
+        if not match:
+            continue
+        person, score, _ = match
+        if score < 80:
+            continue
+
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+        left = int(min(xs))
+        cy = int(sum(ys) / 4)
+
+        # dot is usually just left of the legend text
+        sample_x = max(0, left - 18)
+        color = _avg_color(img_bgr, sample_x, cy, r=8)
+        legend[person] = color
+
+    # Numeric labels inside segments
+    num_re = re.compile(r"^\d+$")
+    numeric = []
+    for bbox, text, conf in ocr:
+        t = text.strip()
+        if conf < 0.45:
+            continue
+        if not num_re.match(t):
+            continue
+
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+        cx = int(sum(xs) / 4)
+        cy = int(sum(ys) / 4)
+        val = int(t)
+
+        col = _avg_color(img_bgr, cx, cy, r=6)
+        numeric.append((cx, cy, val, conf, col))
+
+    extracted = {d[2]: {} for d in dates}
+
+    for cx, cy, val, conf, col in numeric:
+        nearest_date = min(dates, key=lambda d: abs(cx - d[0]))[2]
+
+        if not legend:
+            continue
+
+        best_person = None
+        best_dist = 1e9
+        for person, lcol in legend.items():
+            dist = _color_distance(col, lcol)
+            if dist < best_dist:
+                best_dist = dist
+                best_person = person
+
+        # strict threshold — tune later if needed
+        if best_person is None or best_dist > 70:
+            continue
+
+        extracted[nearest_date][best_person] = val
+
+    debug = {
+        "dates_detected": [d[2] for d in dates],
+        "legend_people_detected": sorted(list(legend.keys())),
+    }
+    return extracted, debug
 
 # =========================================================
 # AUTH
@@ -440,6 +566,37 @@ with tab_uploads:
                 if p.exists():
                     st.image(str(p), width=900)
             st.divider()
+    st.divider()
+    st.subheader("Extract from screenshot (beta)")
+    st.caption("Strict mode: if it can’t read confidently, it skips it (no guessing).")
+
+    people_state = load_people_state()
+    known_people = people_state["active"] + people_state["archived"]
+
+    # Use the most recent upload for this week + currently selected metric
+    idx = load_index()
+    candidates = [x for x in idx if x.get("week_start") == w_iso and x.get("metric") == metric]
+    candidates = list(reversed(candidates))
+
+    if not candidates:
+        st.info("Upload a screenshot for the selected metric first.")
+    else:
+        latest = candidates[0]
+        img_path = UPLOADS_DIR / latest["filename"]
+
+        if img_path.exists():
+            st.image(str(img_path), width=900)
+
+            if st.button("Attempt extract (beta)", use_container_width=True, key=f"extract_{TEAM}_{w_iso}_{metric}"):
+                extracted, dbg = extract_stacked_chart(img_path.read_bytes(), known_people)
+                if "error" in dbg:
+                    st.error(dbg["error"])
+                else:
+                    st.write("Detected dates:", dbg["dates_detected"])
+                    st.write("Detected legend names:", dbg["legend_people_detected"])
+                    st.json(extracted)
+        else:
+            st.warning("Latest upload file not found on disk.")
 
 # =========================================================
 # TAB: BASELINES (people management minimised)
