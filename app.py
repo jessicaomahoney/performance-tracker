@@ -396,94 +396,30 @@ with tab_upload:
 # Tab: Baselines & People
 # ----------------------------
 with tab_baselines:
-    st.subheader("People (Active / Archived)")
+    st.subheader("Baselines (per ACTIVE person)")
+    st.write("This is team-specific (North/South). Archived people are hidden by default.")
 
     state = load_people_state()
     active = state["active"]
     archived = state["archived"]
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("### Active")
-        st.write(active if active else "—")
-    with c2:
-        st.markdown("### Archived")
-        st.write(archived if archived else "—")
-
-    st.divider()
-
-    st.markdown("### Add a person")
-    new_name = st.text_input("Name", key="add_person_name").strip()
-    if st.button("Add to Active", use_container_width=True):
-        if not new_name:
-            st.error("Enter a name first.")
-        else:
-            if new_name in archived:
-                archived.remove(new_name)
-            if new_name not in active:
-                active.append(new_name)
-            # Keep active in name order (optional but helpful)
-            active = sorted(active, key=lambda x: x.lower())
-            save_people_state({"active": active, "archived": archived})
-            st.success(f"Added {new_name}.")
-            st.rerun()
-
-    st.divider()
-
-    st.markdown("### Archive people (remove from current views, keep history)")
-    to_archive = st.multiselect("Select active people to archive", options=active, key="archive_select")
-    if st.button("Archive selected", use_container_width=True):
-        if not to_archive:
-            st.error("Select at least one person to archive.")
-        else:
-            for p in to_archive:
-                if p in active:
-                    active.remove(p)
-                if p not in archived:
-                    archived.append(p)
-            active = sorted(active, key=lambda x: x.lower())
-            archived = sorted(archived, key=lambda x: x.lower())
-            save_people_state({"active": active, "archived": archived})
-            st.success("Archived.")
-            st.rerun()
-
-    st.divider()
-
-    st.markdown("### Restore archived people")
-    to_restore = st.multiselect("Select archived people to restore", options=archived, key="restore_select")
-    if st.button("Restore selected", use_container_width=True):
-        if not to_restore:
-            st.error("Select at least one person to restore.")
-        else:
-            for p in to_restore:
-                if p in archived:
-                    archived.remove(p)
-                if p not in active:
-                    active.append(p)
-            active = sorted(active, key=lambda x: x.lower())
-            archived = sorted(archived, key=lambda x: x.lower())
-            save_people_state({"active": active, "archived": archived})
-            st.success("Restored.")
-            st.rerun()
-
-    st.divider()
-    st.subheader("Baselines (per ACTIVE person)")
-    st.write("These baselines are team-specific (North/South). Archived people are hidden by default.")
-
     baselines = load_baselines()
-    rows = []
-    for p in active:
-        rows.append({
-            "Person": p,
-            "Calls": baselines.get(p, {}).get("Calls", ""),
-            "EA Calls": baselines.get(p, {}).get("EA Calls", ""),
-            "Things Done": baselines.get(p, {}).get("Things Done", ""),
-        })
 
-    if not rows:
-        st.info("No active people. Add someone above to set baselines.")
+    if not active:
+        st.info("No active people yet. Expand 'People management' below to add someone.")
     else:
+        # Baselines table FIRST (most-used)
+        rows = []
+        for p in active:
+            rows.append({
+                "Person": p,
+                "Calls": baselines.get(p, {}).get("Calls", ""),
+                "EA Calls": baselines.get(p, {}).get("EA Calls", ""),
+                "Things Done": baselines.get(p, {}).get("Things Done", ""),
+            })
+
         df = pd.DataFrame(rows)
+
         edited = st.data_editor(
             df,
             use_container_width=True,
@@ -494,7 +430,7 @@ with tab_baselines:
         )
 
         if st.button("Save baselines", use_container_width=True):
-            new_b = load_baselines()  # preserve baselines for archived/historical names
+            new_b = load_baselines()  # keep any historical/archived entries
             for _, r in edited.iterrows():
                 p = str(r["Person"]).strip()
                 if not p:
@@ -506,6 +442,82 @@ with tab_baselines:
                 }
             save_baselines(new_b)
             st.success("Saved baselines.")
+
+    st.divider()
+
+    # Everything else minimised
+    with st.expander("People management (add / archive / restore)", expanded=False):
+        # Show lists nicely (not as Python code)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("### Active")
+            if active:
+                st.markdown("\n".join([f"- {p}" for p in active]))
+            else:
+                st.write("—")
+        with c2:
+            st.markdown("### Archived")
+            if archived:
+                st.markdown("\n".join([f"- {p}" for p in archived]))
+            else:
+                st.write("—")
+
+        st.divider()
+
+        st.markdown("### Add a person")
+        new_name = st.text_input("Name", key="add_person_name").strip()
+        if st.button("Add to Active", use_container_width=True):
+            if not new_name:
+                st.error("Enter a name first.")
+            else:
+                if new_name in archived:
+                    archived.remove(new_name)
+                if new_name not in active:
+                    active.append(new_name)
+                active = sorted(active, key=lambda x: x.lower())
+                archived = sorted(archived, key=lambda x: x.lower())
+                save_people_state({"active": active, "archived": archived})
+                st.success(f"Added {new_name}.")
+                st.rerun()
+
+        st.divider()
+
+        st.markdown("### Archive people (remove from current views, keep history)")
+        to_archive = st.multiselect("Select active people to archive", options=active, key="archive_select")
+        if st.button("Archive selected", use_container_width=True):
+            if not to_archive:
+                st.error("Select at least one person to archive.")
+            else:
+                for p in to_archive:
+                    if p in active:
+                        active.remove(p)
+                    if p not in archived:
+                        archived.append(p)
+                active = sorted(active, key=lambda x: x.lower())
+                archived = sorted(archived, key=lambda x: x.lower())
+                save_people_state({"active": active, "archived": archived})
+                st.success("Archived.")
+                st.rerun()
+
+        st.divider()
+
+        st.markdown("### Restore archived people")
+        to_restore = st.multiselect("Select archived people to restore", options=archived, key="restore_select")
+        if st.button("Restore selected", use_container_width=True):
+            if not to_restore:
+                st.error("Select at least one person to restore.")
+            else:
+                for p in to_restore:
+                    if p in archived:
+                        archived.remove(p)
+                    if p not in active:
+                        active.append(p)
+                active = sorted(active, key=lambda x: x.lower())
+                archived = sorted(archived, key=lambda x: x.lower())
+                save_people_state({"active": active, "archived": archived})
+                st.success("Restored.")
+                st.rerun()
+success("Saved baselines.")
 
 # ----------------------------
 # Tab: Deviations
