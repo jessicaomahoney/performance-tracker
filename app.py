@@ -3,6 +3,30 @@ from datetime import date
 from pathlib import Path
 import json
 
+APP_PASSWORD = "password"  # <- change this to your real password
+
+def check_password():
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if st.session_state.authenticated:
+        return True
+
+    st.title("🔒 Login required")
+    password = st.text_input("Enter password", type="password")
+
+    if password == APP_PASSWORD:
+        st.session_state.authenticated = True
+        st.rerun()
+    elif password:
+        st.error("Incorrect password")
+
+    return False
+
+# Stop the app here unless the password is correct
+if not check_password():
+    st.stop()
+
 st.set_page_config(page_title="Team Performance Tracker", layout="wide")
 
 DATA_DIR = Path("data")
