@@ -5,6 +5,11 @@ import json
 import pandas as pd
 
 # =========================================================
+# PAGE CONFIG (must be first Streamlit call)
+# =========================================================
+st.set_page_config(page_title="Team Performance Tracker", layout="wide")
+
+# =========================================================
 # CONFIG
 # =========================================================
 METRICS = ["Calls", "EA Calls", "Things Done"]
@@ -19,8 +24,8 @@ DEVIATION_MULT = {
     "Reward time": 0.0,
     "Other": 1.0,
 }
+EXEMPT_DEVIATIONS = {"Sick", "Annual leave", "Reward time"}  # baseline becomes 0
 
-# Use Streamlit Secrets if set, otherwise fallback (fine while testing)
 APP_PASSWORD = st.secrets["APP_PASSWORD"] if "APP_PASSWORD" in st.secrets else "password"
 
 # =========================================================
@@ -119,13 +124,12 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 # PEOPLE (ACTIVE/ARCHIVED) + MIGRATION
 # =========================================================
 def default_people_state():
-    # Only used if people file is missing/unreadable.
     return {"active": ["Rebecca", "Nicole", "Sonia"], "archived": []}
 
 def load_people_state():
     raw = load_json(PEOPLE_FILE, default_people_state())
 
-    # Migration: old format might be a plain list of names
+    # migration if old format was a list
     if isinstance(raw, list):
         raw = {"active": raw, "archived": []}
         save_json(PEOPLE_FILE, raw)
@@ -150,14 +154,13 @@ def load_people_state():
     raw["active"] = clean(raw["active"])
     raw["archived"] = clean(raw["archived"])
 
-    # no overlap
+    # prevent overlap (active wins)
     active_set = set(raw["active"])
     raw["archived"] = [x for x in raw["archived"] if x not in active_set]
 
     return raw
 
 def save_people_state(state):
-    # sort for consistency
     state["active"] = sorted(state.get("active", []), key=lambda x: x.lower())
     state["archived"] = sorted(state.get("archived", []), key=lambda x: x.lower())
     save_json(PEOPLE_FILE, state)
@@ -174,15 +177,15 @@ def save_reports(r):
 def ensure_week_structure(reports: dict, week_iso: str, active_people: list):
     """
     - Create week if missing
-    - Sync *new active* people into the week (never removes historical names)
+    - Sync new ACTIVE people into week snapshot (never removes historical names)
     - Ensure metric/action/deviation structures exist
     """
     if week_iso not in reports:
         reports[week_iso] = {
-            "people": list(active_people),   # historical snapshot list
-            "metrics": {},                   # metric -> person -> {Baseline, Mon..Fri}
-            "actions": {},                   # person -> text
-            "deviations": {}                 # person -> {Mon..Fri: option}
+            "people": list(active_people),
+            "metrics": {},
+            "actions": {},
+            "deviations": {}
         }
     else:
         reports[week_iso].setdefault("people", [])
@@ -242,11 +245,7 @@ def generate_report_txt(team: str, week_start: date, block: dict, display_people
                 if adj == 0:
                     parts.append(f"{d} - {val}/EXEMPT ({dev})")
                 else:
-                    # show baseline as integer when it's clean
-                    if float(adj).is_integer():
-                        adj_show = str(int(adj))
-                    else:
-                        adj_show = str(adj)
+                    adj_show = str(int(adj)) if float(adj).is_integer() else str(adj)
                     parts.append(f"{d} - {val}/{adj_show} ({dev})")
 
             lines.append(f"{metric}: " + " | ".join(parts))
@@ -290,9 +289,76 @@ def file_exists(filename: str) -> bool:
     return (UPLOADS_DIR / filename).exists()
 
 # =========================================================
+# COMPLETENESS CHECKS
+# =========================================================
+def run_checks(block: dict, display_people: list, active_set: set, baselines: dict, week_iso: str):
+    """
+    Returns:
+      status: "green" | "amber" | "red"
+      issues: list[str]
+    """
+    issues_red = []
+    issues_amber = []
+
+    # Check: TL actions present
+    for p in display_people:
+        act = (block.get("actions", {}).get(p, "") or "").strip()
+        if not act:
+            issues_red.append(f"TL action missing for **{p}**.")
+
+    deviations = block.get("deviations", {})
+    metrics = block.get("metrics", {})
+
+    # Check: baselines + daily entries
+    for p in display_people:
+        p_dev = deviations.get(p, {d: "Normal" for d in DAYS})
+
+        for m in METRICS:
+            md = metrics.get(m, {}).get(p, {"Baseline": "", **{d: "" for d in DAYS}})
+
+            # baseline used: weekly override OR default baselines tab
+            weekly_base = str(md.get("Baseline", "")).strip()
+            default_base = str(baselines.get(p, {}).get(m, "")).strip()
+            used_base = weekly_base if weekly_base != "" else default_base
+
+            if used_base == "":
+                issues_red.append(f"Baseline missing for **{p}** — **{m}**.")
+            else:
+                if to_float(used_base) is None:
+                    issues_amber.append(f"Baseline is not a number for **{p}** — **{m}** (value: `{used_base}`).")
+
+            # daily values required unless EXEMPT day
+            for d in DAYS:
+                dev = p_dev.get(d, "Normal")
+                v = str(md.get(d, "")).strip()
+
+                if dev in EXEMPT_DEVIATIONS:
+                    # Optional flag: value entered on exempt day (not necessarily wrong)
+                    if v != "":
+                        issues_amber.append(f"Value entered on EXEMPT day for **{p}** — **{m}** — {d} ({dev}).")
+                    continue
+
+                # Non-exempt days must have a value
+                if v == "":
+                    issues_red.append(f"Missing value for **{p}** — **{m}** — {d} (deviation: {dev}).")
+
+    # Check: uploads present for the week (helpful but not required)
+    idx = load_index()
+    week_uploads = week_items(idx, week_iso)
+    for m in METRICS:
+        cnt = sum(1 for x in metric_items(week_uploads, m) if x.get("filename") and file_exists(x["filename"]))
+        if cnt == 0:
+            issues_amber.append(f"No screenshot uploaded for **{m}** this week (optional, but recommended).")
+
+    if issues_red:
+        return "red", issues_red + issues_amber
+    if issues_amber:
+        return "amber", issues_amber
+    return "green", []
+
+# =========================================================
 # UI
 # =========================================================
-st.set_page_config(page_title=f"Team Performance Tracker — {TEAM}", layout="wide")
 st.title(f"📊 Team Performance Tracker — {TEAM}")
 
 with st.sidebar:
@@ -328,7 +394,7 @@ with tab_uploads:
 
     cols = st.columns(3)
     for i, m in enumerate(METRICS):
-        c = sum(1 for x in metric_items(items, m) if file_exists(x["filename"]))
+        c = sum(1 for x in metric_items(items, m) if x.get("filename") and file_exists(x["filename"]))
         cols[i].metric(m, f"{'✅' if c > 0 else '❌'}  {c} uploaded")
 
     st.divider()
@@ -376,7 +442,7 @@ with tab_uploads:
             st.divider()
 
 # =========================================================
-# TAB: BASELINES (with people management minimised)
+# TAB: BASELINES (people management minimised)
 # =========================================================
 with tab_baselines:
     st.subheader("Baselines (Active people only)")
@@ -409,7 +475,6 @@ with tab_baselines:
         )
 
         if st.button("Save baselines", use_container_width=True, key=f"save_baselines_{TEAM}"):
-            # preserve existing baselines (including archived) unless overwritten
             new_b = load_json(BASELINES_FILE, {})
             for _, r in edited.iterrows():
                 person = str(r["Person"]).strip()
@@ -492,6 +557,7 @@ with tab_deviations:
 
     people_state = load_people_state()
     active = people_state["active"]
+    active_set = set(active)
 
     default_week = monday_of(date.today())
     dev_week = monday_of(st.date_input("Week starting (Monday)", value=default_week, key="dev_week"))
@@ -505,7 +571,7 @@ with tab_deviations:
 
     block = load_reports()[dev_week_iso]
     week_people_all = block.get("people", [])
-    display_people = week_people_all if show_archived else [p for p in week_people_all if p in set(active)]
+    display_people = week_people_all if show_archived else [p for p in week_people_all if p in active_set]
 
     st.caption(f"Selected week: **{week_label(dev_week)}**")
 
@@ -542,13 +608,14 @@ with tab_deviations:
         st.success("Saved deviations.")
 
 # =========================================================
-# TAB: WEEKLY REPORT
+# TAB: WEEKLY REPORT (checks + copy/paste preview)
 # =========================================================
 with tab_report:
     st.subheader("Weekly report (per person)")
 
     people_state = load_people_state()
     active = people_state["active"]
+    active_set = set(active)
 
     default_week = monday_of(date.today())
     rep_week = monday_of(st.date_input("Report week starting (Monday)", value=default_week, key="rep_week"))
@@ -564,7 +631,7 @@ with tab_report:
 
     block = load_reports()[rep_week_iso]
     week_people_all = block.get("people", [])
-    display_people = week_people_all if show_archived else [p for p in week_people_all if p in set(active)]
+    display_people = week_people_all if show_archived else [p for p in week_people_all if p in active_set]
 
     st.caption(f"Selected week: **{week_label(rep_week)}**")
 
@@ -650,6 +717,37 @@ with tab_report:
     report_txt = generate_report_txt(TEAM, rep_week, block, display_people)
     report_tsv = generate_report_tsv(block, display_people)
 
+    # ✅ Checks
+    status, issues = run_checks(block, display_people, active_set, baselines, rep_week_iso)
+
+    st.subheader("Readiness checks")
+    if status == "green":
+        st.success("✅ Ready to send. No issues found.")
+    elif status == "amber":
+        st.warning("🟠 Some items need attention before sending.")
+    else:
+        st.error("🔴 Not ready to send. Fix the red items first.")
+
+    if issues:
+        st.markdown("**Issues:**")
+        for it in issues:
+            st.markdown(f"- {it}")
+
+    st.divider()
+
+    # ✅ Copy/paste preview
+    st.subheader("Report preview (copy/paste)")
+    st.caption("Tip: click inside → Ctrl+A → Ctrl+C (Chromebook friendly).")
+    st.text_area(
+        "Weekly report text",
+        value=report_txt,
+        height=520,
+        key=f"preview_{TEAM}_{rep_week_iso}_{'all' if show_archived else 'active'}"
+    )
+
+    st.divider()
+
+    # Downloads (still useful for attaching / saving history)
     st.subheader("Downloads")
     st.download_button(
         "Download weekly report (TXT)",
