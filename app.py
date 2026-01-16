@@ -3,6 +3,13 @@ from datetime import date, timedelta
 from pathlib import Path
 import json
 import pandas as pd
+import re
+import numpy as np
+from io import BytesIO
+from PIL import Image
+import cv2
+import easyocr
+from rapidfuzz import process, fuzz
 
 # =========================================================
 # PAGE CONFIG (must be first Streamlit call)
@@ -82,6 +89,140 @@ def mark_dirty(reason: str):
 def clear_dirty():
     st.session_state["dirty"] = False
     st.session_state["dirty_reason"] = ""
+# # =========================================================
+# OCR + EXTRACTION (BETA)
+# =========================================================
+
+@st.cache_resource
+def get_ocr_reader():
+    return easyocr.Reader(["en"], gpu=False)
+
+def _avg_color(img_bgr, x, y, r=6):
+    h, w = img_bgr.shape[:2]
+    x1, x2 = max(0, x - r), min(w, x + r)
+    y1, y2 = max(0, y - r), min(h, y + r)
+    patch = img_bgr[y1:y2, x1:x2]
+    if patch.size == 0:
+        return np.array([0, 0, 0], dtype=np.float32)
+    return patch.reshape(-1, 3).mean(axis=0)
+
+def _color_distance(c1, c2):
+    return float(np.linalg.norm(c1 - c2))
+
+def extract_stacked_chart_to_monfri(image_bytes, known_people):
+    """
+    Strict extractor:
+    - Detects 5 date labels along x-axis (e.g., Jan 5 ...), sorts left->right,
+      maps them to Mon..Fri by position (no year needed).
+    - Detects legend names and dot colors.
+    - Detects numeric labels inside bars and assigns by color match.
+
+    Returns:
+      out: { "Mon": {"Person": 12, ...}, "Tue": {...}, ... }
+      debug: dict
+    """
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    img_np = np.array(img)
+    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+    reader = get_ocr_reader()
+    ocr = reader.readtext(img_np)  # [ (bbox, text, conf), ... ]
+
+    # ---- Find x-axis labels like "Jan 5"
+    date_re = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d{1,2}$", re.I)
+    ticks = []
+    for bbox, text, conf in ocr:
+        t = text.strip()
+        if conf >= 0.5 and date_re.match(t):
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            cx = int(sum(xs) / 4)
+            cy = int(sum(ys) / 4)
+            ticks.append((cx, cy, t.title(), conf))
+
+    ticks = sorted(ticks, key=lambda x: x[0])
+    if len(ticks) < 5:
+        return {}, {"error": f"Could not detect 5 date ticks reliably (found {len(ticks)})."}
+
+    # take the 5 left-most ticks (usually Mon-Fri)
+    ticks = ticks[:5]
+    tick_x = [t[0] for t in ticks]
+
+    # ---- Legend mapping: fuzzy match names + sample dot color just left of the name
+    legend = {}  # person -> sampled color (BGR)
+    for bbox, text, conf in ocr:
+        t = text.strip()
+        if conf < 0.45 or len(t) < 3:
+            continue
+
+        match = process.extractOne(t, known_people, scorer=fuzz.partial_ratio)
+        if not match:
+            continue
+        person, score, _ = match
+        if score < 80:
+            continue
+
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+        left = int(min(xs))
+        cy = int(sum(ys) / 4)
+
+        sample_x = max(0, left - 18)  # dot is usually just left of text
+        color = _avg_color(img_bgr, sample_x, cy, r=8)
+        legend[person] = color
+
+    if not legend:
+        return {}, {"error": "Legend names could not be matched. Add full names (as shown in chart legend) into People."}
+
+    # ---- Numeric labels inside segments
+    num_re = re.compile(r"^\d+$")
+    numeric = []
+    for bbox, text, conf in ocr:
+        t = text.strip()
+        if conf < 0.45:
+            continue
+        if not num_re.match(t):
+            continue
+
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+        cx = int(sum(xs) / 4)
+        cy = int(sum(ys) / 4)
+        val = int(t)
+
+        col = _avg_color(img_bgr, cx, cy, r=6)
+        numeric.append((cx, cy, val, conf, col))
+
+    # Map each numeric label to nearest tick, then to Mon..Fri
+    day_by_tick_index = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri"}
+    out = {d: {} for d in ["Mon", "Tue", "Wed", "Thu", "Fri"]}
+
+    for cx, cy, val, conf, col in numeric:
+        # nearest tick index by x distance
+        idx = int(np.argmin([abs(cx - tx) for tx in tick_x]))
+        day = day_by_tick_index.get(idx)
+
+        # choose closest legend color
+        best_person, best_dist = None, 1e9
+        for person, lcol in legend.items():
+            dist = _color_distance(col, lcol)
+            if dist < best_dist:
+                best_dist = dist
+                best_person = person
+
+        # strict threshold (tune if needed)
+        if best_person is None or best_dist > 70:
+            continue
+
+        out[day][best_person] = val
+
+    debug = {
+        "ticks_detected": [t[2] for t in ticks],
+        "legend_people_detected": sorted(list(legend.keys())),
+        "numbers_detected": len(numeric),
+    }
+    return out, debug
+
 
 # =========================================================
 # AUTH
@@ -584,6 +725,76 @@ with tab_uploads:
             mark_dirty("uploads deleted")
             st.success("Deleted selected uploads.")
             st.rerun()
+    st.divider()
+    st.subheader("Extract & apply (beta)")
+    st.caption("Strict mode: if it can’t confidently map a number to a person/day, it writes UNREADABLE (no guessing).")
+
+    # Use most recent upload for this week + selected metric
+    idx = load_index()
+    candidates = [x for x in idx if x.get("week_start") == w_iso and x.get("metric") == metric]
+    candidates = list(reversed(candidates))
+
+    people_state = load_people_state()
+    known_people = people_state["active"] + people_state["archived"]
+
+    if not candidates:
+        st.info("Upload a screenshot for the selected metric first (and click Save uploads).")
+    else:
+        latest = candidates[0]
+        img_path = P["UPLOADS"] / latest["filename"]
+
+        if not img_path.exists():
+            st.warning("Latest upload file not found on disk (Streamlit may have reset uploads). Re-upload the screenshot.")
+        else:
+            st.image(str(img_path), width=900)
+
+            if st.button("Attempt extract (preview)", use_container_width=True, key=f"extract_preview_{TEAM}_{w_iso}_{metric}"):
+                extracted, dbg = extract_stacked_chart_to_monfri(img_path.read_bytes(), known_people)
+                if "error" in dbg:
+                    st.error(dbg["error"])
+                else:
+                    st.write("Detected ticks:", dbg["ticks_detected"])
+                    st.write("Detected legend names:", dbg["legend_people_detected"])
+                    st.json(extracted)
+                    st.session_state["last_extracted"] = {"week_iso": w_iso, "metric": metric, "data": extracted}
+
+            if st.button("Apply extraction to weekly tables", use_container_width=True, key=f"extract_apply_{TEAM}_{w_iso}_{metric}"):
+                payload = st.session_state.get("last_extracted")
+                if not payload or payload.get("week_iso") != w_iso or payload.get("metric") != metric:
+                    st.error("Run 'Attempt extract (preview)' first for this week + metric.")
+                else:
+                    extracted = payload["data"]
+                    reports = load_reports()
+                    people_state = load_people_state()
+                    active = people_state["active"]
+                    ensure_week_structure(reports, w_iso, active)
+
+                    block = reports[w_iso]
+                    metric_store = block["metrics"].get(metric, {})
+
+                    # For every day/person in extracted, write value; if person not known in week, skip.
+                    for day in DAYS:
+                        day_map = extracted.get(day, {})
+                        for person in block["people"]:
+                            if person in day_map:
+                                metric_store.setdefault(person, {"Baseline": "", **{d: "" for d in DAYS}})
+                                metric_store[person][day] = str(day_map[person])
+
+                    # Fill UNREADABLE where expected people are missing for a day (strict)
+                    for day in DAYS:
+                        day_map = extracted.get(day, {})
+                        for person in block["people"]:
+                            # only fill UNREADABLE if person is in known_people list AND not present in extract
+                            if person in known_people and person not in day_map:
+                                metric_store.setdefault(person, {"Baseline": "", **{d: "" for d in DAYS}})
+                                if str(metric_store[person].get(day, "")).strip() == "":
+                                    metric_store[person][day] = "UNREADABLE"
+
+                    block["metrics"][metric] = metric_store
+                    reports[w_iso] = block
+                    save_reports(reports)
+                    mark_dirty(f"extraction applied for {metric}")
+                    st.success(f"Applied extraction to {metric} for week {w_iso}. Now check Weekly report tab.")
 
 # =========================================================
 # TAB: BASELINES
@@ -872,6 +1083,42 @@ with tab_report:
     st.text_area("Weekly report text", value=report_txt, height=520, key=f"preview_{TEAM}_{rep_week_iso}")
 
     st.divider()
+        st.subheader("✅ TL checklist (do this every week)")
+    if status != "green":
+        st.warning("Finish the missing items above until the report is GREEN. Then complete the checklist below.")
+    else:
+        st.success("Report is GREEN — now complete the export steps below.")
+
+    cA, cB = st.columns(2)
+    with cA:
+        st.markdown("**1) Save backup JSON to the right folder**")
+        st.markdown(f"[Open backup folder]({BACKUP_FOLDER_URL})")
+        cur_backup = build_team_backup(TEAM)
+        st.download_button(
+            "Download CURRENT backup.json",
+            data=json.dumps(cur_backup, indent=2).encode("utf-8"),
+            file_name=f"{TEAM.lower()}_backup.json",
+            mime="application/json",
+            use_container_width=True,
+            disabled=(status != "green"),
+            key=f"dl_weekly_backup_{TEAM}_{rep_week_iso}"
+        )
+
+    with cB:
+        st.markdown("**2) Export Weekly WIDE CSV to the tracker**")
+        st.markdown(f"[Open performance tracker]({TRACKER_SHEET_URL})")
+        st.download_button(
+            "Download Weekly WIDE CSV",
+            data=export_week_wide_csv(TEAM, rep_week_iso),
+            file_name=f"{TEAM.lower()}_weekly_wide_{rep_week_iso}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            disabled=(status != "green"),
+            key=f"dl_weekly_wide_{TEAM}_{rep_week_iso}"
+        )
+
+    st.caption("Tip: In Google Sheets: File → Import → Upload → Replace current sheet or insert new sheet.")
+
     st.subheader("Downloads")
     st.download_button(
         "Download weekly report (TXT)",
