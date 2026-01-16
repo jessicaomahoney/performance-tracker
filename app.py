@@ -126,7 +126,7 @@ def extract_stacked_chart_to_monfri(image_bytes, known_people):
       out: { "Mon": {"Person": 12, ...}, ... }
       debug: dict
     """
-  img = Image.open(BytesIO(image_bytes)).convert("RGB")
+img = Image.open(BytesIO(image_bytes)).convert("RGB")
 
 # --- Downscale to improve OCR stability on blurry screenshots
 max_w = 1600
