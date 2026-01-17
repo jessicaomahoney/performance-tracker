@@ -4,13 +4,14 @@ from pathlib import Path
 import json
 import pandas as pd
 
+# OCR / extraction (optional)
 import re
 import numpy as np
 from io import BytesIO
 from PIL import Image
 import cv2
 import easyocr
-from rapidfuzz import fuzz
+from rapidfuzz import process, fuzz
 
 # =========================================================
 # PAGE CONFIG (must be first Streamlit call)
@@ -23,39 +24,44 @@ st.set_page_config(page_title="Team Performance Tracker", layout="wide")
 METRICS = ["Calls", "EA Calls", "Things Done"]
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]
 
-DEVIATION_OPTIONS = ["Normal", "Half day", "Sick", "Annual leave", "Reward time", "Excluded", "Other"]
+DEVIATION_OPTIONS = ["Normal", "Half day", "Sick", "Annual leave", "Reward time", "Other"]
 DEVIATION_MULT = {
     "Normal": 1.0,
     "Half day": 0.5,
     "Sick": 0.0,
     "Annual leave": 0.0,
     "Reward time": 0.0,
-    "Excluded": 0.0,   # <-- important
     "Other": 1.0,
 }
-EXEMPT_DEVIATIONS = {"Sick", "Annual leave", "Reward time", "Excluded"}
+EXEMPT_DEVIATIONS = {"Sick", "Annual leave", "Reward time"}
 
-APP_PASSWORD = st.secrets["APP_PASSWORD"] if "APP_PASSWORD" in st.secrets else "password"
+# Password (Streamlit secrets if available)
+APP_PASSWORD = st.secrets.get("APP_PASSWORD", "password")
 
-# 🔗 Your links
+# 🔗 Paste your links here
 TRACKER_SHEET_URL = "https://docs.google.com/spreadsheets/d/1t3IvVgIrqC8P9Txca5fZM96rBLvWA6NGu1yb-HD4qHM/edit?gid=0#gid=0"
 BACKUP_FOLDER_URL = "https://drive.google.com/drive/folders/1GdvL_eUJK9ShiSr3yD-O1A8HFAYyXBC-"
 
-# OCR tuning
-DEFAULT_OCR_MAX_W = 2200
+# OCR tuning defaults
+DEFAULT_MAX_OCR_WIDTH = 1800
+DEFAULT_COLOR_DIST_THRESHOLD = 140
 
 # =========================================================
 # HELPERS
 # =========================================================
+
 def monday_of(d: date) -> date:
     return d - timedelta(days=d.weekday())
+
 
 def iso(d: date) -> str:
     return d.isoformat()
 
+
 def week_label(week_start: date) -> str:
     week_end = week_start + timedelta(days=6)
     return f"{week_start.strftime('%d %b %Y')} – {week_end.strftime('%d %b %Y')}"
+
 
 def to_float(x):
     try:
@@ -68,6 +74,7 @@ def to_float(x):
     except Exception:
         return None
 
+
 def load_json(path: Path, default):
     if not path.exists():
         return default
@@ -76,9 +83,11 @@ def load_json(path: Path, default):
     except Exception:
         return default
 
+
 def save_json(path: Path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+
 
 def team_paths(team: str):
     base = Path("data") / team
@@ -89,21 +98,25 @@ def team_paths(team: str):
         "PEOPLE": base / "people.json",
         "BASELINES": base / "baselines.json",
         "REPORTS": base / "reports.json",
+        "META": base / "meta.json",
     }
+
 
 def mark_dirty(reason: str):
     st.session_state["dirty"] = True
     st.session_state["dirty_reason"] = reason
 
+
 def clear_dirty():
     st.session_state["dirty"] = False
     st.session_state["dirty_reason"] = ""
 
-def file_exists(p: Path) -> bool:
-    try:
-        return p.exists()
-    except Exception:
-        return False
+
+def now_stamp() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+
+# ---- name normalisation + mapping (prevents "extract works but nothing writes")
 
 def _norm_name(s: str) -> str:
     s = (s or "").strip().lower()
@@ -112,282 +125,341 @@ def _norm_name(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+
 def build_name_map(extracted_people, target_people, min_score=85):
-    """
-    Map extracted names -> app names (handles Ben vs Ben Morton, apostrophes, etc.)
-    Returns dict: extracted_name -> target_name
-    """
+    """Map extracted names (e.g. 'Ben Morton') to target names in-app (e.g. 'Ben')."""
     mapping = {}
-    targets = list(target_people)
+    target_norm = {p: _norm_name(p) for p in target_people}
 
     for ep in extracted_people:
         epn = _norm_name(ep)
-        best_tp, best_score = None, 0
-        for tp in targets:
-            score = fuzz.token_set_ratio(epn, _norm_name(tp))
+        best_p, best_score = None, 0
+        for tp, tpn in target_norm.items():
+            score = fuzz.token_set_ratio(epn, tpn)
             if score > best_score:
                 best_score = score
-                best_tp = tp
-        if best_tp and best_score >= min_score:
-            mapping[ep] = best_tp
+                best_p = tp
+        if best_p and best_score >= min_score:
+            mapping[ep] = best_p
     return mapping
 
+
 # =========================================================
-# OCR
+# OCR + EXTRACTION (BETA) — stacked chart (legacy)
 # =========================================================
+
 @st.cache_resource
 def get_ocr_reader():
     return easyocr.Reader(["en"], gpu=False)
 
-def _prep_for_ocr(img: Image.Image, max_w=DEFAULT_OCR_MAX_W):
-    img = img.convert("RGB")
+
+def _avg_color(img_bgr, x, y, r=6):
+    h, w = img_bgr.shape[:2]
+    x1, x2 = max(0, x - r), min(w, x + r)
+    y1, y2 = max(0, y - r), min(h, y + r)
+    patch = img_bgr[y1:y2, x1:x2]
+    if patch.size == 0:
+        return np.array([0, 0, 0], dtype=np.float32)
+    return patch.reshape(-1, 3).mean(axis=0)
+
+
+def _color_distance(c1, c2):
+    return float(np.linalg.norm(c1 - c2))
+
+
+def preprocess_for_ocr(image_bytes: bytes, max_w: int = DEFAULT_MAX_OCR_WIDTH):
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
     if img.width > max_w:
         scale = max_w / float(img.width)
         img = img.resize((max_w, int(img.height * scale)), Image.Resampling.LANCZOS)
 
     img_np = np.array(img)
-    bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-    # improve clarity
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.0)
     sharp = cv2.addWeighted(gray, 1.6, blur, -0.6, 0)
     sharp = cv2.equalizeHist(sharp)
-
     thr = cv2.adaptiveThreshold(
         sharp, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
         31, 7
     )
-    return img, thr
+    return img, img_np, img_bgr, thr
 
-def _center(bbox):
-    xs = [p[0] for p in bbox]
-    ys = [p[1] for p in bbox]
-    return (sum(xs) / 4.0, sum(ys) / 4.0)
 
-def extract_table_screenshot_to_monfri(image_bytes, known_people, week_start: date):
-    """
-    Reads the TABLE screenshot like:
-      Completed Date | Ben Morton (Count) | Hanah ... etc
-    Then maps by actual date -> Mon..Fri of selected week.
-
-    Returns:
-      out: { "Mon": {"Person": 12, ...}, ... }
-      debug: dict
-    """
-    img = Image.open(BytesIO(image_bytes))
-    _, thr = _prep_for_ocr(img)
+def extract_stacked_chart_to_monfri(
+    image_bytes,
+    known_people,
+    max_w=DEFAULT_MAX_OCR_WIDTH,
+    color_dist_threshold=DEFAULT_COLOR_DIST_THRESHOLD,
+):
+    img, img_np, img_bgr, thr = preprocess_for_ocr(image_bytes, max_w=max_w)
 
     reader = get_ocr_reader()
     ocr = reader.readtext(thr)
 
-    date_re = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    # ---- Find x-axis labels like "Jan 5"
+    date_re = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d{1,2}$", re.I)
+    ticks = []
+    for bbox, text, conf in ocr:
+        t = str(text).strip()
+        if conf >= 0.50 and date_re.match(t):
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            cx = int(sum(xs) / 4)
+            cy = int(sum(ys) / 4)
+            ticks.append((cx, cy, t.title(), conf))
+
+    ticks = sorted(ticks, key=lambda x: x[0])
+    if len(ticks) < 5:
+        return {}, {"error": f"I couldn’t detect 5 date ticks (found {len(ticks)}). Try a less cropped screenshot."}
+
+    ticks = ticks[:5]
+    tick_x = [t[0] for t in ticks]
+
+    # ---- Legend mapping
+    legend = {}  # person -> sampled colour (BGR)
+    for bbox, text, conf in ocr:
+        t = str(text).strip()
+        if conf < 0.35 or len(t) < 3:
+            continue
+
+        match = process.extractOne(t, known_people, scorer=fuzz.partial_ratio)
+        if not match:
+            continue
+        person, score, _ = match
+        if score < 80:
+            continue
+
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+        left = int(min(xs))
+        cy = int(sum(ys) / 4)
+
+        sample_x = max(0, left - 18)
+        color = _avg_color(img_bgr, sample_x, cy, r=8)
+        legend[person] = color
+
+    if not legend:
+        return {}, {"error": "I couldn’t match any legend names. Make sure the chart legend matches your People list."}
+
+    # ---- Numeric labels
     num_re = re.compile(r"^\d+$")
-
-    # 1) collect date cells
-    dates = []
+    numeric = []
     for bbox, text, conf in ocr:
         t = str(text).strip()
-        if conf >= 0.55 and date_re.match(t):
-            cx, cy = _center(bbox)
-            dates.append({"text": t, "cx": cx, "cy": cy})
-
-    if not dates:
-        return {}, {"error": "No YYYY-MM-DD dates detected. Use the table screenshot (not the chart)."}
-
-    # group rows by y (dates define rows)
-    dates = sorted(dates, key=lambda r: r["cy"])
-
-    # 2) detect header names (top area)
-    header_candidates = []
-    for bbox, text, conf in ocr:
-        t = str(text).strip()
-        if conf < 0.40:
+        if conf < 0.30:
             continue
-        if len(t) < 3:
-            continue
-        if date_re.match(t) or num_re.match(t):
+        if not num_re.match(t):
             continue
 
-        cx, cy = _center(bbox)
-        # header region tends to be near top (before first date row)
-        if cy < dates[0]["cy"] - 10:
-            header_candidates.append((t, cx, cy, conf))
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+        cx = int(sum(xs) / 4)
+        cy = int(sum(ys) / 4)
+        val = int(t)
 
-    # match header candidates to known people
-    people_x = {}
-    for t, cx, cy, conf in header_candidates:
-        # ignore obvious non-names
-        low = t.lower()
-        if "count" in low or "completed" in low or "date" in low or "things" in low:
-            continue
+        col = _avg_color(img_bgr, cx, cy + 12, r=8)
+        numeric.append((cx, cy, val, conf, col))
 
-        best_p, best_score = None, 0
-        for p in known_people:
-            score = fuzz.token_set_ratio(_norm_name(t), _norm_name(p))
-            if score > best_score:
-                best_score = score
-                best_p = p
-        if best_p and best_score >= 85:
-            # store x center for that person column
-            # if already exists, keep the one with higher confidence-ish (closer to top)
-            if best_p not in people_x or cy < people_x[best_p]["cy"]:
-                people_x[best_p] = {"x": cx, "cy": cy, "raw": t, "score": best_score}
-
-    if not people_x:
-        return {}, {"error": "Could not detect any person headers. Ensure names are visible at the top of the table."}
-
-    # 3) collect numeric cells
-    nums = []
-    for bbox, text, conf in ocr:
-        t = str(text).strip()
-        if conf < 0.45:
-            continue
-        if num_re.match(t):
-            cx, cy = _center(bbox)
-            nums.append({"val": int(t), "cx": cx, "cy": cy})
-
-    # helper: map date -> day label if within selected Mon-Fri
-    def date_to_day(dstr):
-        try:
-            dt = datetime.strptime(dstr, "%Y-%m-%d").date()
-        except Exception:
-            return None
-        if dt < week_start or dt > (week_start + timedelta(days=4)):
-            return None
-        idx = dt.weekday()  # Mon=0
-        if idx < 0 or idx > 4:
-            return None
-        return DAYS[idx]
-
+    day_by_tick_index = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri"}
     out = {d: {} for d in DAYS}
+
     applied = 0
+    for cx, cy, val, conf, col in numeric:
+        idx = int(np.argmin([abs(cx - tx) for tx in tick_x]))
+        day = day_by_tick_index.get(idx)
 
-    # for each date row, find numeric values in same row area and nearest to each person x
-    # "row band" = around the date's cy
-    row_band = 18
+        best_person, best_dist = None, 1e9
+        for person, lcol in legend.items():
+            dist = _color_distance(col, lcol)
+            if dist < best_dist:
+                best_dist = dist
+                best_person = person
 
-    for drow in dates:
-        day = date_to_day(drow["text"])
-        if not day:
+        if best_person is None or best_dist > color_dist_threshold:
             continue
 
-        row_y = drow["cy"]
-        row_nums = [n for n in nums if abs(n["cy"] - row_y) <= row_band]
-
-        for person, meta in people_x.items():
-            px = meta["x"]
-            # nearest number by x distance within row band
-            best = None
-            best_dx = 1e9
-            for n in row_nums:
-                dx = abs(n["cx"] - px)
-                if dx < best_dx:
-                    best_dx = dx
-                    best = n
-            if best is None:
-                continue
-            # strict-ish: must be reasonably close to column x
-            if best_dx > 90:
-                continue
-            out[day][person] = best["val"]
-            applied += 1
+        out[day][best_person] = val
+        applied += 1
 
     debug = {
-        "people_headers_found": {p: people_x[p]["raw"] for p in sorted(people_x.keys())},
-        "dates_found": len(dates),
-        "numbers_found": len(nums),
-        "cells_applied": applied,
+        "mode": "stacked",
+        "ticks_detected": [t[2] for t in ticks],
+        "legend_people_detected": sorted(list(legend.keys())),
+        "numbers_detected": len(numeric),
+        "numbers_applied": applied,
+        "image_size_used": {"w": img.width, "h": img.height},
+        "color_dist_threshold": color_dist_threshold,
+        "max_width_used": max_w,
     }
     return out, debug
 
-# =========================================================
-# CSV PARSING (BEST)
-# =========================================================
-def extract_csv_to_monfri(csv_bytes, known_people, week_start: date):
-    """
-    CSV should have a date column and one column per person.
-    We map by actual date -> Mon..Fri.
-    """
-    raw = csv_bytes.decode("utf-8", errors="ignore")
 
-    # Try normal header first
-    df = None
+# =========================================================
+# CSV PARSING (recommended)
+# =========================================================
+
+MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _safe_int(x):
     try:
-        df = pd.read_csv(BytesIO(raw.encode("utf-8")))
+        if pd.isna(x):
+            return None
+        s = str(x).strip()
+        if s in ("", "Ø", "ø", "0/", "-"):
+            return None
+        # strip commas
+        s = s.replace(",", "")
+        if re.fullmatch(r"\d+", s):
+            return int(s)
+        # sometimes "0" should be 0
+        if re.fullmatch(r"\d+\.0", s):
+            return int(float(s))
+        return None
     except Exception:
-        pass
+        return None
 
-    # Try 2-row header (sometimes exports include Count row)
-    if df is None or df.shape[1] <= 1:
-        try:
-            df = pd.read_csv(BytesIO(raw.encode("utf-8")), header=[0, 1])
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        except Exception:
-            return {}, {"error": "Could not read CSV. Try downloading the table as CSV again."}
 
-    cols = list(df.columns)
+def parse_csv_to_monfri(df: pd.DataFrame, week_start: date, known_people: list):
+    """
+    Accepts several CSV shapes:
 
-    # find date column
+    1) Wide per metric table:
+       Person,Baseline,Mon,Tue,Wed,Thu,Fri
+
+    2) Our exported long-ish shape:
+       Team,week_iso,Person,Metric,Baseline,Mon,Tue,Wed,Thu,Fri
+
+    3) Date-based table:
+       Completed Date,<person columns...>
+       (or any date column) + numeric columns
+
+    Returns:
+      out: {Mon:{person:val}, ...}
+      dbg
+    """
+    out = {d: {} for d in DAYS}
+    dbg = {"mode": "csv", "rows": int(df.shape[0]), "cols": int(df.shape[1])}
+
+    # Normalize column names
+    df2 = df.copy()
+    df2.columns = [str(c).strip() for c in df2.columns]
+    cols_lower = {c.lower(): c for c in df2.columns}
+
+    # Case 2: includes Metric column
+    if "metric" in cols_lower and "person" in cols_lower and "mon" in cols_lower:
+        # Filter should be done outside per metric, but we can still parse to Mon-Fri
+        for _, r in df2.iterrows():
+            person = str(r[cols_lower["person"]]).strip()
+            if not person:
+                continue
+            # Map to known people if needed
+            if known_people:
+                m = build_name_map([person], known_people, min_score=80)
+                person = m.get(person, person)
+
+            for d in DAYS:
+                v = _safe_int(r.get(d, r.get(d.lower(), None)))
+                if v is None:
+                    continue
+                out[d][person] = v
+        dbg["shape"] = "team_week_metric"
+        return out, dbg
+
+    # Case 1: simple wide
+    if "person" in cols_lower and "mon" in cols_lower:
+        for _, r in df2.iterrows():
+            person = str(r[cols_lower["person"]]).strip()
+            if not person:
+                continue
+            if known_people:
+                m = build_name_map([person], known_people, min_score=80)
+                person = m.get(person, person)
+
+            for d in DAYS:
+                v = _safe_int(r.get(d))
+                if v is None:
+                    continue
+                out[d][person] = v
+        dbg["shape"] = "person_monfri_wide"
+        return out, dbg
+
+    # Case 3: date column
     date_col = None
-    for c in cols:
-        if "date" in str(c).lower():
+    for c in df2.columns:
+        cl = c.lower()
+        if "date" in cl:
             date_col = c
             break
-    if date_col is None:
-        date_col = cols[0]  # fallback
 
-    # normalize person columns
-    person_cols = [c for c in cols if c != date_col]
-    if not person_cols:
-        return {}, {"error": "CSV has no person columns. Ensure you downloaded the data table, not an empty file."}
+    if date_col:
+        # Coerce date column
+        dates = pd.to_datetime(df2[date_col], errors="coerce")
+        df2 = df2.assign(__date=dates)
 
-    def date_to_day(dval):
-        try:
-            if isinstance(dval, str):
-                dt = datetime.strptime(dval.strip()[:10], "%Y-%m-%d").date()
-            else:
-                dt = pd.to_datetime(dval).date()
-        except Exception:
-            return None
-        if dt < week_start or dt > (week_start + timedelta(days=4)):
-            return None
-        idx = dt.weekday()
-        if idx < 0 or idx > 4:
-            return None
-        return DAYS[idx]
+        start = pd.Timestamp(week_start)
+        end = pd.Timestamp(week_start + timedelta(days=6))
+        dfw = df2[(df2["__date"] >= start) & (df2["__date"] <= end)].copy()
 
-    out = {d: {} for d in DAYS}
-    applied = 0
+        if dfw.empty:
+            dbg["shape"] = "date_table_no_rows_in_week"
+            dbg["error"] = "No rows in this week range."
+            return out, dbg
 
-    # Build mapping of CSV col names -> app people names
-    name_map = build_name_map(person_cols, known_people, min_score=80)
-
-    for _, row in df.iterrows():
-        day = date_to_day(row.get(date_col))
-        if not day:
-            continue
-        for col in person_cols:
-            target = name_map.get(col)
-            if not target:
+        # Build weekday mapping
+        for _, r in dfw.iterrows():
+            dt = r["__date"]
+            if pd.isna(dt):
                 continue
-            v = row.get(col, "")
-            if pd.isna(v):
+            weekday = dt.weekday()  # Mon=0
+            if weekday < 0 or weekday > 4:
                 continue
-            s = str(v).strip()
-            if s == "" or s in {"Ø", "ø"}:
-                continue
-            if re.match(r"^\d+$", s):
-                out[day][target] = int(s)
-                applied += 1
+            day = DAYS[weekday]
 
-    debug = {"columns_mapped": name_map, "cells_applied": applied}
-    return out, debug
+            # For each person column, if numeric then assign
+            for c in dfw.columns:
+                if c in (date_col, "__date"):
+                    continue
+                # skip obvious non-data
+                if str(c).lower() in ("baseline", "metric", "team", "week_iso"):
+                    continue
+
+                v = _safe_int(r.get(c))
+                if v is None:
+                    continue
+
+                # Column name might include "Count" or similar
+                person_guess = str(c)
+                person_guess = re.sub(r"\bcount\b", "", person_guess, flags=re.I).strip()
+
+                if known_people:
+                    m = build_name_map([person_guess], known_people, min_score=75)
+                    person = m.get(person_guess)
+                    if not person:
+                        continue
+                else:
+                    person = person_guess
+
+                out[day][person] = v
+
+        dbg["shape"] = "date_wide_person_cols"
+        return out, dbg
+
+    dbg["shape"] = "unknown"
+    dbg["error"] = "Couldn’t understand that CSV format. Try exporting with Person/Baseline/Mon–Fri, or include a Date column." 
+    return out, dbg
+
 
 # =========================================================
 # AUTH
 # =========================================================
+
 def check_password() -> bool:
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
@@ -396,22 +468,25 @@ def check_password() -> bool:
         return True
 
     st.title("🔒 Login required")
-    pw = st.text_input("Enter password", type="password", key="login_pw")
+    pw = st.text_input("Password", type="password", key="login_pw")
 
     if pw == APP_PASSWORD:
         st.session_state.authenticated = True
         st.rerun()
     elif pw:
-        st.error("Incorrect password")
+        st.error("Nope — that password doesn’t match.")
 
     return False
+
 
 if not check_password():
     st.stop()
 
+
 # =========================================================
 # TEAM SELECT
 # =========================================================
+
 def choose_team() -> str:
     if "team" not in st.session_state:
         st.session_state.team = None
@@ -419,13 +494,14 @@ def choose_team() -> str:
     if st.session_state.team:
         return st.session_state.team
 
-    st.title("Select team")
-    team = st.radio("Where do you want to work?", ["North", "South"], horizontal=True, key="team_pick")
-    if st.button("Continue", use_container_width=True, key="team_continue"):
+    st.title("👋 Which team are you working on?")
+    team = st.radio("", ["North", "South"], horizontal=True, key="team_pick")
+    if st.button("➡️ Continue", use_container_width=True, key="team_continue"):
         st.session_state.team = team
         st.rerun()
 
     st.stop()
+
 
 TEAM = choose_team()
 P = team_paths(TEAM)
@@ -435,17 +511,22 @@ P["UPLOADS"].mkdir(parents=True, exist_ok=True)
 if "dirty" not in st.session_state:
     clear_dirty()
 
+
 # =========================================================
 # DATA ACCESS
 # =========================================================
+
 def default_people_state():
-    return {"active": ["Rebecca", "Nicole", "Sonia"], "archived": []}
+    # IMPORTANT: do NOT auto-overwrite saved people.
+    return {"active": [], "archived": []}
+
 
 def load_people_state():
     raw = load_json(P["PEOPLE"], default_people_state())
+
+    # If some old version saved a list, upgrade safely
     if isinstance(raw, list):
         raw = {"active": raw, "archived": []}
-        save_json(P["PEOPLE"], raw)
 
     if not isinstance(raw, dict):
         raw = default_people_state()
@@ -457,7 +538,9 @@ def load_people_state():
         out, seen = [], set()
         for x in lst:
             name = str(x).strip()
-            if not name or name in seen:
+            if not name:
+                continue
+            if name in seen:
                 continue
             seen.add(name)
             out.append(name)
@@ -465,36 +548,60 @@ def load_people_state():
 
     raw["active"] = clean(raw["active"])
     raw["archived"] = clean(raw["archived"])
+
+    # Remove duplicates across lists
     active_set = set(raw["active"])
     raw["archived"] = [x for x in raw["archived"] if x not in active_set]
+
+    # Persist file if missing (prevents "vanish" when Streamlit reruns)
+    if not P["PEOPLE"].exists():
+        save_json(P["PEOPLE"], raw)
+
     return raw
+
 
 def save_people_state(state):
     state["active"] = sorted(state.get("active", []), key=lambda x: x.lower())
     state["archived"] = sorted(state.get("archived", []), key=lambda x: x.lower())
     save_json(P["PEOPLE"], state)
 
+
 def load_baselines():
     return load_json(P["BASELINES"], {})
+
 
 def save_baselines(b):
     save_json(P["BASELINES"], b)
 
+
 def load_reports():
     return load_json(P["REPORTS"], {})
+
 
 def save_reports(r):
     save_json(P["REPORTS"], r)
 
+
 def load_index():
     return load_json(P["INDEX"], [])
+
 
 def save_index(idx):
     save_json(P["INDEX"], idx)
 
+
+def load_meta():
+    return load_json(P["META"], {"last_backup_at": ""})
+
+
+def save_meta(m):
+    save_json(P["META"], m)
+
+
 # =========================================================
 # REPORT STRUCTURE
 # =========================================================
+
 def ensure_week_structure(reports: dict, week_iso: str, active_people: list):
     if week_iso not in reports:
         reports[week_iso] = {"people": list(active_people), "metrics": {}, "actions": {}, "deviations": {}}
@@ -517,9 +624,11 @@ def ensure_week_structure(reports: dict, week_iso: str, active_people: list):
         reports[week_iso]["actions"].setdefault(p, "")
         reports[week_iso]["deviations"].setdefault(p, {d: "Normal" for d in DAYS})
 
+
 # =========================================================
 # REPORT OUTPUTS
 # =========================================================
+
 def generate_report_txt(team: str, week_start: date, block: dict, display_people: list) -> str:
     metrics = block.get("metrics", {})
     actions = block.get("actions", {})
@@ -529,8 +638,8 @@ def generate_report_txt(team: str, week_start: date, block: dict, display_people
     lines.append(f"{team} — Weekly performance report — {week_label(week_start)}")
     lines.append(f"Week start (ISO): {iso(week_start)}")
     lines.append("")
-    lines.append("Deviations adjust baseline fairly (Sick/AL/Reward time/Excluded = EXEMPT, Half day = 50%).")
-    lines.append("This report is designed to stand alone (no spreadsheet context).")
+    lines.append("📌 Deviations adjust baselines fairly (Sick/AL/Reward time = EXEMPT, Half day = 50%).")
+    lines.append("This report is designed to stand alone (no spreadsheet context needed).")
     lines.append("")
     lines.append("------------------------------------------------------------")
     lines.append("")
@@ -550,22 +659,21 @@ def generate_report_txt(team: str, week_start: date, block: dict, display_people
                 dev = p_dev.get(d, "Normal")
                 mult = DEVIATION_MULT.get(dev, 1.0)
 
-                if dev in EXEMPT_DEVIATIONS:
-                    parts.append(f"{d} - {val}/EXEMPT ({dev})" if val else f"{d} - EXEMPT ({dev})")
-                    continue
-
                 if base is None:
-                    parts.append(f"{d} - {val}")
+                    parts.append(f"{d} — {val}")
                     continue
 
                 adj = base * mult
-                adj_show = str(int(adj)) if float(adj).is_integer() else str(adj)
-                parts.append(f"{d} - {val}/{adj_show} ({dev})")
+                if adj == 0:
+                    parts.append(f"{d} — {val}/EXEMPT ({dev})")
+                else:
+                    adj_show = str(int(adj)) if float(adj).is_integer() else str(adj)
+                    parts.append(f"{d} — {val}/{adj_show} ({dev})")
 
             lines.append(f"{metric}: " + " | ".join(parts))
 
         lines.append("")
-        lines.append("TL action (what I will do about it):")
+        lines.append("🧭 TL action (what I will do about it):")
         act = (actions.get(person, "") or "").strip()
         lines.append(act if act else "[NOT FILLED IN]")
         lines.append("")
@@ -573,6 +681,7 @@ def generate_report_txt(team: str, week_start: date, block: dict, display_people
         lines.append("")
 
     return "\n".join(lines)
+
 
 def generate_report_tsv(block: dict, display_people: list) -> str:
     metrics = block.get("metrics", {})
@@ -584,16 +693,35 @@ def generate_report_tsv(block: dict, display_people: list) -> str:
             rows.append("\t".join(row))
     return "\n".join(rows)
 
+
+# =========================================================
+# UPLOAD INDEX HELPERS
+# =========================================================
+
+def week_items(idx, week_iso: str):
+    return [x for x in idx if x.get("week_start") == week_iso]
+
+
+def metric_items(items, metric: str):
+    return [x for x in items if x.get("metric") == metric]
+
+
+def file_exists(filename: str) -> bool:
+    return (P["UPLOADS"] / filename).exists()
+
+
 # =========================================================
 # CHECKS
 # =========================================================
+
 def run_checks(block: dict, display_people: list, active_set: set, baselines: dict, week_iso: str):
     issues_red, issues_amber = [], []
 
+    # TL actions
     for p in display_people:
         act = (block.get("actions", {}).get(p, "") or "").strip()
         if not act:
-            issues_red.append(f"TL action missing for **{p}**.")
+            issues_red.append(f"🧭 TL action missing for **{p}**.")
 
     deviations = block.get("deviations", {})
     metrics = block.get("metrics", {})
@@ -608,19 +736,27 @@ def run_checks(block: dict, display_people: list, active_set: set, baselines: di
             used_base = weekly_base if weekly_base != "" else default_base
 
             if used_base == "":
-                issues_red.append(f"Baseline missing for **{p}** — **{m}**.")
+                issues_red.append(f"🎯 Baseline missing for **{p}** — **{m}**.")
             elif to_float(used_base) is None:
-                issues_amber.append(f"Baseline is not a number for **{p}** — **{m}** (value: `{used_base}`).")
+                issues_amber.append(f"⚠️ Baseline is not a number for **{p}** — **{m}** (value: `{used_base}`).")
 
             for d in DAYS:
                 dev = p_dev.get(d, "Normal")
                 v = str(md.get(d, "")).strip()
 
                 if dev in EXEMPT_DEVIATIONS:
+                    # If exempt, leaving blank is fine.
                     continue
 
                 if v == "":
-                    issues_red.append(f"Missing value for **{p}** — **{m}** — {d} (deviation: {dev}).")
+                    issues_red.append(f"📅 Missing value for **{p}** — **{m}** — {d} (deviation: {dev}).")
+
+    idx = load_index()
+    week_uploads = week_items(idx, week_iso)
+    for m in METRICS:
+        cnt = sum(1 for x in metric_items(week_uploads, m) if x.get("filename") and file_exists(x["filename"]))
+        if cnt == 0:
+            issues_amber.append(f"📎 No upload/CSV for **{m}** this week (optional).")
 
     if issues_red:
         return "red", issues_red + issues_amber
@@ -628,9 +764,11 @@ def run_checks(block: dict, display_people: list, active_set: set, baselines: di
         return "amber", issues_amber
     return "green", []
 
+
 # =========================================================
 # BACKUP / EXPORT HELPERS
 # =========================================================
+
 def build_team_backup(team: str):
     tp = team_paths(team)
     tp["BASE"].mkdir(parents=True, exist_ok=True)
@@ -640,6 +778,7 @@ def build_team_backup(team: str):
     baselines = load_json(tp["BASELINES"], {})
     reports = load_json(tp["REPORTS"], {})
     idx = load_json(tp["INDEX"], [])
+    meta = load_json(tp["META"], {"last_backup_at": ""})
 
     return {
         "team": team,
@@ -647,8 +786,10 @@ def build_team_backup(team: str):
         "baselines": baselines,
         "reports": reports,
         "uploads_index": idx,
-        "note": "Backup includes people/baselines/reports/index. Uploaded files may be lost if Streamlit resets."
+        "meta": meta,
+        "note": "Backup includes people/baselines/reports/index/meta. Uploaded files are NOT included (Streamlit Cloud may wipe them).",
     }
+
 
 def restore_team_backup(backup_obj: dict, target_team: str):
     tp = team_paths(target_team)
@@ -659,11 +800,14 @@ def restore_team_backup(backup_obj: dict, target_team: str):
     save_json(tp["BASELINES"], backup_obj.get("baselines", {}))
     save_json(tp["REPORTS"], backup_obj.get("reports", {}))
     save_json(tp["INDEX"], backup_obj.get("uploads_index", []))
+    save_json(tp["META"], backup_obj.get("meta", {"last_backup_at": ""}))
+
 
 def export_week_wide_csv(team: str, week_iso: str) -> bytes:
-    b = build_team_backup(team)
-    reports = b["reports"]
-    block = reports.get(week_iso, None)
+    tp = team_paths(team)
+    reports = load_json(tp["REPORTS"], {})
+    block = reports.get(week_iso)
+
     if not block:
         df = pd.DataFrame([{"Team": team, "week_iso": week_iso, "error": "No data for this week"}])
         return df.to_csv(index=False).encode("utf-8")
@@ -671,7 +815,13 @@ def export_week_wide_csv(team: str, week_iso: str) -> bytes:
     rows = []
     for metric in METRICS:
         for person, md in block.get("metrics", {}).get(metric, {}).items():
-            row = {"Team": team, "week_iso": week_iso, "Person": person, "Metric": metric, "Baseline": md.get("Baseline", "")}
+            row = {
+                "Team": team,
+                "week_iso": week_iso,
+                "Person": person,
+                "Metric": metric,
+                "Baseline": md.get("Baseline", ""),
+            }
             for d in DAYS:
                 row[d] = md.get(d, "")
             rows.append(row)
@@ -679,215 +829,327 @@ def export_week_wide_csv(team: str, week_iso: str) -> bytes:
     df = pd.DataFrame(rows)
     return df.to_csv(index=False).encode("utf-8")
 
-# =========================================================
-# UPLOAD INDEX HELPERS
-# =========================================================
-def week_items(idx, week_iso: str):
-    return [x for x in idx if x.get("week_start") == week_iso]
 
-def metric_items(items, metric: str):
-    return [x for x in items if x.get("metric") == metric]
+# =========================================================
+# APPLY HELPERS
+# =========================================================
 
-def latest_file_for(idx, week_iso, metric, kind):
-    # kind = "csv" or "img"
-    items = [x for x in idx if x.get("week_start") == week_iso and x.get("metric") == metric and x.get("kind") == kind]
-    items = list(reversed(items))
-    return items[0] if items else None
+def apply_extracted_to_week(reports: dict, week_iso: str, metric: str, extracted: dict, known_people: list):
+    """Write extracted {Mon:{name:val}} into reports[week_iso] for the given metric."""
+    block = reports[week_iso]
+    metric_store = block["metrics"].get(metric, {})
+
+    # map extracted names -> week people
+    extracted_names = set()
+    for d in DAYS:
+        extracted_names |= set(extracted.get(d, {}).keys())
+
+    name_map = build_name_map(list(extracted_names), list(block["people"]), min_score=80)
+
+    wrote = 0
+    for d in DAYS:
+        for ep, val in extracted.get(d, {}).items():
+            tp = name_map.get(ep)
+            if not tp:
+                continue
+            metric_store.setdefault(tp, {"Baseline": "", **{dd: "" for dd in DAYS}})
+            metric_store[tp][d] = "" if val is None else str(val)
+            wrote += 1
+
+    block["metrics"][metric] = metric_store
+    reports[week_iso] = block
+    return wrote, name_map
+
 
 # =========================================================
 # UI
 # =========================================================
+
 st.title(f"📊 Team Performance Tracker — {TEAM}")
 
-st.warning(
-    "⚠️ Streamlit Cloud can reset and wipe saved data. "
-    "Use **💾 Backup & Export** to download backups regularly (especially after edits)."
+meta = load_meta()
+last_backup = meta.get("last_backup_at", "")
+
+st.info(
+    "👋 Hey! This app saves to a small on-server folder — but Streamlit Cloud can sometimes reset it.\n\n"
+    "✅ Make your life easy: use **💾 Backup & Export** every week (it’s 2 clicks)."
 )
+
 if st.session_state.get("dirty", False):
-    st.info(f"🟦 Safety step: download a backup (reason: {st.session_state.get('dirty_reason','changes made')}).")
+    st.warning(f"🟦 Quick safety nudge: please download a backup (reason: {st.session_state.get('dirty_reason','changes made')}).")
+
+if not last_backup:
+    st.warning("💾 I can’t see a ‘last backup’ timestamp yet. Once you download a backup, we’ll show it here.")
+else:
+    st.caption(f"💾 Last backup recorded: **{last_backup}**")
 
 with st.sidebar:
-    st.subheader("Team")
-    st.write(f"**{TEAM}**")
-    if st.button("Switch team", key="switch_team_btn"):
+    st.subheader("🧭 Navigation")
+    st.write(f"Team: **{TEAM}**")
+
+    if st.button("🔁 Switch team", use_container_width=True, key="switch_team_btn"):
         st.session_state.team = None
         st.rerun()
-    if st.button("Log out", key="logout_btn"):
+
+    if st.button("🚪 Log out", use_container_width=True, key="logout_btn"):
         st.session_state.authenticated = False
         st.session_state.team = None
         st.rerun()
 
+    st.divider()
+    st.markdown("### 🔗 Quick links")
+    st.markdown(f"📁 [Backup folder]({BACKUP_FOLDER_URL})")
+    st.markdown(f"📊 [Performance tracker]({TRACKER_SHEET_URL})")
+
+
+# Load people early + show a gentle prompt if empty
+people_state = load_people_state()
+if not people_state.get("active") and not people_state.get("archived"):
+    st.warning("👥 Your People list is empty right now. Pop into **🎯 Baselines → People management** to add people (or restore from backup).")
+
+
 tab_uploads, tab_baselines, tab_deviations, tab_report, tab_backup = st.tabs(
-    ["✅ Uploads", "🎯 Baselines", "🗓️ Deviations", "📝 Weekly report", "💾 Backup & Export"]
+    ["📥 Uploads", "🎯 Baselines", "🗓️ Deviations", "📝 Weekly report", "💾 Backup & Export"]
 )
+
 
 # =========================================================
 # TAB: UPLOADS
 # =========================================================
 with tab_uploads:
-    st.subheader("Uploads")
+    st.subheader("📥 Uploads")
+    st.caption("Upload either **screenshots** *or* **CSVs**. Then hit one button to extract + apply into the Weekly report.")
 
     default_week = monday_of(date.today())
     week_start = monday_of(st.date_input("Week starting (Monday)", value=default_week, key="uploads_week"))
     w_iso = iso(week_start)
 
-    people_state = load_people_state()
-    known_people = people_state["active"] + people_state["archived"]
+    idx = load_index()
+    items = week_items(idx, w_iso)
+
+    st.caption(f"🗓️ Selected week: **{week_label(week_start)}**")
+    st.divider()
+
+    # Summary tiles
+    cols = st.columns(3)
+    for i, m in enumerate(METRICS):
+        mi = metric_items(items, m)
+        count_files = sum(1 for x in mi if x.get("filename") and file_exists(x["filename"]))
+        cols[i].metric(m, f"{count_files} file(s)")
+
+    st.divider()
+
+    st.markdown("### 1) Add uploads")
+    metric = st.selectbox("Which metric is this for?", METRICS, key="uploads_metric")
+
+    up_img = st.file_uploader(
+        "📸 Upload a screenshot (PNG/JPG)",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        key="uploads_img",
+    )
+
+    up_csv = st.file_uploader(
+        "📄 Upload a CSV (recommended)",
+        type=["csv"],
+        accept_multiple_files=True,
+        key="uploads_csv",
+    )
+
+    if st.button("✅ Save uploads", use_container_width=True, key="save_uploads_btn"):
+        if not up_img and not up_csv:
+            st.error("Please upload at least one screenshot or CSV.")
+        else:
+            idx = load_index()
+            saved = 0
+
+            # Save screenshots
+            for f in (up_img or []):
+                safe_name = f"{w_iso}_{metric}_image_{f.name}".replace(" ", "_")
+                (P["UPLOADS"] / safe_name).write_bytes(f.getbuffer())
+                idx.append({"week_start": w_iso, "metric": metric, "filename": safe_name, "kind": "image"})
+                saved += 1
+
+            # Save CSVs
+            for f in (up_csv or []):
+                safe_name = f"{w_iso}_{metric}_csv_{f.name}".replace(" ", "_")
+                (P["UPLOADS"] / safe_name).write_bytes(f.getbuffer())
+                idx.append({"week_start": w_iso, "metric": metric, "filename": safe_name, "kind": "csv"})
+                saved += 1
+            save_index(idx)
+            mark_dirty("uploads saved")
+            st.success(f"🎉 Saved {saved} file(s) for **{metric}**.")
+            st.rerun()
+
+    st.divider()
+    st.markdown("### 2) Review + delete uploads")
 
     idx = load_index()
     items = week_items(idx, w_iso)
 
-    st.caption(f"Selected week: **{week_label(week_start)}**")
-    st.divider()
+    if not items:
+        st.info("No uploads saved for this week yet.")
+    else:
+        # Show per metric
+        for m in METRICS:
+            mi = metric_items(items, m)
+            if not mi:
+                continue
+            st.markdown(f"#### {m}")
+            for it in reversed(mi[-10:]):
+                pth = P["UPLOADS"] / it["filename"]
+                if not pth.exists():
+                    st.warning(f"Missing file on disk: {it['filename']} (Streamlit may have reset).")
+                    continue
+                if it.get("kind") == "csv" or pth.suffix.lower() == ".csv":
+                    st.caption(f"📄 CSV: {it['filename']}")
+                else:
+                    st.caption(f"📸 Image: {it['filename']}")
+                    st.image(str(pth), width=900)
+            st.divider()
 
-    # show status
-    cols = st.columns(3)
-    for i, m in enumerate(METRICS):
-        csv_count = sum(1 for x in metric_items(items, m) if x.get("kind") == "csv")
-        img_count = sum(1 for x in metric_items(items, m) if x.get("kind") == "img")
-        cols[i].metric(m, f"CSV: {csv_count} | Images: {img_count}")
+        # Delete UI
+        options = []
+        for i, it in enumerate(items):
+            options.append(f"{i} | {it.get('metric')} | {it.get('kind','?')} | {it.get('filename')}")
 
-    st.divider()
-    st.markdown("### Upload a file for the selected metric")
-    st.caption("Best: upload the CSV from the table (near-perfect). If not, upload the table screenshot.")
+        to_delete = st.multiselect("🗑️ Select uploads to delete", options=options, key=f"del_{TEAM}_{w_iso}")
+        if st.button("🗑️ Delete selected uploads", use_container_width=True, key=f"del_btn_{TEAM}_{w_iso}"):
+            delete_set = set(to_delete)
+            new_items = []
+            for i, it in enumerate(items):
+                label = f"{i} | {it.get('metric')} | {it.get('kind','?')} | {it.get('filename')}"
+                if label in delete_set:
+                    fp = P["UPLOADS"] / it.get("filename", "")
+                    try:
+                        if fp.exists():
+                            fp.unlink()
+                    except Exception:
+                        pass
+                else:
+                    new_items.append(it)
 
-    metric = st.selectbox("Metric", METRICS, key="uploads_metric")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        up_csv = st.file_uploader("Upload CSV export (recommended)", type=["csv"], key=f"csv_{TEAM}_{w_iso}_{metric}")
-    with c2:
-        up_img = st.file_uploader("Upload TABLE screenshot (PNG/JPG)", type=["png", "jpg", "jpeg"], key=f"img_{TEAM}_{w_iso}_{metric}")
-
-    if st.button("Save upload for this metric", use_container_width=True, key=f"save_one_{TEAM}_{w_iso}_{metric}"):
-        if not up_csv and not up_img:
-            st.error("Upload a CSV or an image first.")
-        else:
-            idx = load_index()
-            saved = []
-
-            if up_csv:
-                safe_name = f"{w_iso}_{metric}_table.csv".replace(" ", "_")
-                out_path = P["UPLOADS"] / safe_name
-                out_path.write_bytes(up_csv.getbuffer())
-                idx.append({"week_start": w_iso, "metric": metric, "filename": safe_name, "kind": "csv"})
-                saved.append("CSV")
-
-            if up_img:
-                safe_name = f"{w_iso}_{metric}_table.png".replace(" ", "_")
-                out_path = P["UPLOADS"] / safe_name
-                out_path.write_bytes(up_img.getbuffer())
-                idx.append({"week_start": w_iso, "metric": metric, "filename": safe_name, "kind": "img"})
-                saved.append("Image")
-
-            save_index(idx)
-            mark_dirty("upload saved")
-            st.success(f"Saved: {', '.join(saved)} for {metric}.")
+            new_idx = [x for x in idx if x.get("week_start") != w_iso] + new_items
+            save_index(new_idx)
+            mark_dirty("uploads deleted")
+            st.success("✅ Deleted selected uploads.")
             st.rerun()
 
     st.divider()
+    st.markdown("### 3) ✨ Extract data and apply to Weekly report")
+    st.caption("One button. All metrics. We’ll use CSVs first (best), and screenshots as fallback.")
 
-    st.markdown("### ✅ One-click automation")
-    st.caption("This will extract **Calls + EA Calls + Things Done** and apply them to the Weekly report for this week.")
+    # OCR controls (only used if screenshots are used)
+    with st.expander("⚙️ Screenshot extraction settings (only if needed)", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            max_w = st.selectbox("OCR max width", [1200, 1400, 1600, 1800], index=3, key=f"ocr_maxw_{TEAM}_{w_iso}")
+        with c2:
+            dist_thr = st.selectbox("Colour match strictness", [90, 110, 120, 140, 160], index=3, key=f"ocr_thr_{TEAM}_{w_iso}")
 
-    auto_exclude = st.checkbox(
-        "Auto-mark people as EXCLUDED if they have no values in all extracted metrics",
-        value=True,
-        key=f"auto_excl_{TEAM}_{w_iso}"
-    )
+        st.caption("Tip: if screenshots are blurry, 1800 + 160 can help — but CSV is always best.")
 
-    if st.button("✨ Extract data & apply to weekly report", use_container_width=True, key=f"run_all_apply_{TEAM}_{w_iso}"):
-        status = st.status("Working… extracting and applying data", expanded=True)
+    if st.button("✨ Extract data and apply to Weekly report", use_container_width=True, key=f"run_all_apply_{TEAM}_{w_iso}"):
+        people_state = load_people_state()
+        known_people = people_state.get("active", []) + people_state.get("archived", [])
 
         reports = load_reports()
-        ensure_week_structure(reports, w_iso, people_state["active"])
-        block = reports[w_iso]
+        ensure_week_structure(reports, w_iso, people_state.get("active", []))
 
         idx = load_index()
-        per_metric_summary = {}
-        all_written_people = set()
+        items = week_items(idx, w_iso)
+
+        # progress UI
+        use_status = hasattr(st, "status")
+        status_ctx = None
+        if use_status:
+            status_ctx = st.status("⏳ Working on it… extracting and applying", expanded=True)
+
+        def _log(msg):
+            if use_status and status_ctx is not None:
+                status_ctx.write(msg)
+            else:
+                st.write(msg)
+
+        summary = {}
+        overall_wrote = 0
 
         for m in METRICS:
-            status.write(f"• {m}: locating latest upload…")
-            rec_csv = latest_file_for(idx, w_iso, m, "csv")
-            rec_img = latest_file_for(idx, w_iso, m, "img")
+            _log(f"🔎 **{m}** — looking for files…")
 
-            extracted = None
-            dbg = None
+            mi = metric_items(items, m)
+            # Prefer latest CSV, else latest image
+            latest_csv = next((x for x in reversed(mi) if x.get("kind") == "csv" or str(x.get("filename", "")).lower().endswith(".csv")), None)
+            latest_img = next((x for x in reversed(mi) if x.get("kind") == "image"), None)
 
-            if rec_csv:
-                fp = P["UPLOADS"] / rec_csv["filename"]
-                if file_exists(fp):
-                    status.write(f"  - Using CSV: {rec_csv['filename']}")
-                    extracted, dbg = extract_csv_to_monfri(fp.read_bytes(), known_people, week_start)
+            extracted = {d: {} for d in DAYS}
+            dbg = {}
+
+            if latest_csv:
+                fp = P["UPLOADS"] / latest_csv["filename"]
+                if fp.exists():
+                    _log("📄 Using CSV (best).")
+                    try:
+                        df = pd.read_csv(fp)
+                        extracted, dbg = parse_csv_to_monfri(df, week_start=week_start, known_people=known_people)
+                    except Exception as e:
+                        dbg = {"error": f"CSV read failed: {e}"}
                 else:
-                    status.write("  - CSV file missing on disk (re-upload).")
+                    dbg = {"error": "CSV file missing on disk (Streamlit reset?)"}
 
-            if extracted is None and rec_img:
-                fp = P["UPLOADS"] / rec_img["filename"]
-                if file_exists(fp):
-                    status.write(f"  - Using image OCR: {rec_img['filename']}")
-                    extracted, dbg = extract_table_screenshot_to_monfri(fp.read_bytes(), known_people, week_start)
+            elif latest_img:
+                fp = P["UPLOADS"] / latest_img["filename"]
+                if fp.exists():
+                    _log("📸 Using screenshot fallback (beta).")
+                    extracted, dbg = extract_stacked_chart_to_monfri(
+                        fp.read_bytes(),
+                        known_people,
+                        max_w=int(max_w),
+                        color_dist_threshold=int(dist_thr),
+                    )
                 else:
-                    status.write("  - Image file missing on disk (re-upload).")
-
-            if extracted is None:
-                per_metric_summary[m] = "No usable upload found"
-                continue
-            if dbg and "error" in dbg:
-                per_metric_summary[m] = f"Error: {dbg['error']}"
+                    dbg = {"error": "Image file missing on disk (Streamlit reset?)"}
+            else:
+                summary[m] = "No files uploaded"
+                _log("⚠️ No files found for this metric.")
                 continue
 
-            # Apply into weekly report
-            metric_store = block["metrics"].get(m, {})
-            wrote = 0
+            if dbg.get("error"):
+                summary[m] = f"❌ {dbg['error']}"
+                _log(f"❌ {dbg['error']}")
+                continue
 
-            # map extracted names -> week people names
-            extracted_names = set()
-            for d in DAYS:
-                extracted_names |= set(extracted.get(d, {}).keys())
-            name_map = build_name_map(list(extracted_names), list(block["people"]), min_score=85)
+            wrote, name_map = apply_extracted_to_week(reports, w_iso, m, extracted, known_people)
+            overall_wrote += wrote
 
-            for d in DAYS:
-                for ep, val in extracted.get(d, {}).items():
-                    tp = name_map.get(ep)
-                    if not tp:
-                        continue
-                    metric_store.setdefault(tp, {"Baseline": "", **{day: "" for day in DAYS}})
-                    metric_store[tp][d] = str(val)
-                    wrote += 1
-                    all_written_people.add(tp)
+            # Helpful diagnostics
+            filled_people = sorted({p for d in DAYS for p in extracted.get(d, {}).keys()})
+            summary[m] = {
+                "✅ wrote_cells": wrote,
+                "👥 extracted_people": filled_people,
+                "🔁 name_map": name_map,
+                "🧪 debug": dbg,
+            }
+            _log(f"✅ Applied **{m}** — wrote **{wrote}** cells.")
 
-            block["metrics"][m] = metric_store
-            per_metric_summary[m] = f"Applied {wrote} cells"
-            status.write(f"  - Done. {per_metric_summary[m]}")
-
-        # Auto-exclude (whole week) if no values anywhere
-        if auto_exclude:
-            no_values_people = [p for p in block["people"] if p not in all_written_people]
-            if no_values_people:
-                status.write(f"• Auto-excluding: {', '.join(no_values_people)}")
-                block.setdefault("deviations", {})
-                for p in no_values_people:
-                    block["deviations"].setdefault(p, {d: "Normal" for d in DAYS})
-                    for d in DAYS:
-                        block["deviations"][p][d] = "Excluded"
-
-        reports[w_iso] = block
         save_reports(reports)
-        mark_dirty("extracted+applied")
+        mark_dirty("extracted + applied")
 
-        status.update(label="Done ✅ Data extracted & applied to Weekly report", state="complete", expanded=False)
-        st.success("Finished. Summary:")
-        st.json(per_metric_summary)
-        st.info("Now go to **📝 Weekly report** and you should see the numbers filled in.")
+        if use_status and status_ctx is not None:
+            status_ctx.update(label="✅ Done! Extraction + apply finished", state="complete", expanded=False)
+
+        st.success(f"🎉 All done! I applied **{overall_wrote}** cells into the Weekly report for **{week_label(week_start)}**.")
+        st.caption("If you expected more values: check the summary below — especially the name_map.")
+        st.json(summary)
         st.rerun()
+
 
 # =========================================================
 # TAB: BASELINES
 # =========================================================
 with tab_baselines:
-    st.subheader("Baselines (Active people only)")
+    st.subheader("🎯 Baselines")
+    st.caption("Set baselines per person. These auto-fill into the Weekly report (you can override per week if needed).")
 
     people_state = load_people_state()
     active = people_state["active"]
@@ -895,7 +1157,7 @@ with tab_baselines:
     baselines = load_baselines()
 
     if not active:
-        st.info("No active people yet. Expand 'People management' below to add someone.")
+        st.info("No active people yet. Add them below 👇")
     else:
         rows = []
         for p in active:
@@ -912,10 +1174,10 @@ with tab_baselines:
             hide_index=True,
             use_container_width=True,
             column_config={"Person": st.column_config.TextColumn(disabled=True)},
-            key=f"baselines_editor_{TEAM}"
+            key=f"baselines_editor_{TEAM}",
         )
 
-        if st.button("Save baselines", use_container_width=True, key=f"save_baselines_{TEAM}"):
+        if st.button("✅ Save baselines", use_container_width=True, key=f"save_baselines_{TEAM}"):
             new_b = load_baselines()
             for _, r in edited.iterrows():
                 person = str(r["Person"]).strip()
@@ -928,23 +1190,24 @@ with tab_baselines:
                 }
             save_baselines(new_b)
             mark_dirty("baselines saved")
-            st.success("Saved baselines.")
+            st.success("🎉 Baselines saved!")
 
     st.divider()
-    with st.expander("People management (add / archive / restore)", expanded=False):
+
+    with st.expander("👥 People management (add / archive / restore)", expanded=True):
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("### Active")
+            st.markdown("### ✅ Active")
             st.markdown("\n".join([f"- {p}" for p in active]) if active else "—")
         with c2:
-            st.markdown("### Archived")
+            st.markdown("### 🗄️ Archived")
             st.markdown("\n".join([f"- {p}" for p in archived]) if archived else "—")
 
         st.divider()
         new_name = st.text_input("Add person name", key=f"add_person_{TEAM}").strip()
-        if st.button("Add to Active", use_container_width=True, key=f"add_person_btn_{TEAM}"):
+        if st.button("➕ Add to Active", use_container_width=True, key=f"add_person_btn_{TEAM}"):
             if not new_name:
-                st.error("Enter a name first.")
+                st.error("Type a name first 🙂")
             else:
                 if new_name in archived:
                     archived.remove(new_name)
@@ -952,12 +1215,12 @@ with tab_baselines:
                     active.append(new_name)
                 save_people_state({"active": active, "archived": archived})
                 mark_dirty("people changed")
-                st.success(f"Added {new_name}.")
+                st.success(f"✅ Added **{new_name}**")
                 st.rerun()
 
         st.divider()
         to_archive = st.multiselect("Archive selected", options=active, key=f"archive_select_{TEAM}")
-        if st.button("Archive", use_container_width=True, key=f"archive_btn_{TEAM}"):
+        if st.button("🗄️ Archive", use_container_width=True, key=f"archive_btn_{TEAM}"):
             for p in to_archive:
                 if p in active:
                     active.remove(p)
@@ -965,12 +1228,12 @@ with tab_baselines:
                     archived.append(p)
             save_people_state({"active": active, "archived": archived})
             mark_dirty("people changed")
-            st.success("Archived.")
+            st.success("✅ Archived.")
             st.rerun()
 
         st.divider()
         to_restore = st.multiselect("Restore selected", options=archived, key=f"restore_select_{TEAM}")
-        if st.button("Restore", use_container_width=True, key=f"restore_btn_{TEAM}"):
+        if st.button("♻️ Restore", use_container_width=True, key=f"restore_btn_{TEAM}"):
             for p in to_restore:
                 if p in archived:
                     archived.remove(p)
@@ -978,14 +1241,16 @@ with tab_baselines:
                     active.append(p)
             save_people_state({"active": active, "archived": archived})
             mark_dirty("people changed")
-            st.success("Restored.")
+            st.success("✅ Restored.")
             st.rerun()
+
 
 # =========================================================
 # TAB: DEVIATIONS
 # =========================================================
 with tab_deviations:
-    st.subheader("Deviations")
+    st.subheader("🗓️ Deviations")
+    st.caption("Use this for sick days, half days etc — it adjusts baselines fairly in the report text.")
 
     people_state = load_people_state()
     active = people_state["active"]
@@ -1005,7 +1270,7 @@ with tab_deviations:
     week_people_all = block.get("people", [])
     display_people = week_people_all if show_archived else [p for p in week_people_all if p in active_set]
 
-    st.caption(f"Selected week: **{week_label(dev_week)}**")
+    st.caption(f"🗓️ Selected week: **{week_label(dev_week)}**")
 
     if not display_people:
         st.info("No active people to show. Add/restore people in Baselines.")
@@ -1025,10 +1290,10 @@ with tab_deviations:
             "Person": st.column_config.TextColumn(disabled=True),
             **{d: st.column_config.SelectboxColumn(options=DEVIATION_OPTIONS) for d in DAYS},
         },
-        key=f"deviations_editor_{TEAM}_{dev_week_iso}_{'all' if show_archived else 'active'}"
+        key=f"deviations_editor_{TEAM}_{dev_week_iso}_{'all' if show_archived else 'active'}",
     )
 
-    if st.button("Save deviations", use_container_width=True, key=f"save_dev_{TEAM}_{dev_week_iso}_{'all' if show_archived else 'active'}"):
+    if st.button("✅ Save deviations", use_container_width=True, key=f"save_dev_{TEAM}_{dev_week_iso}_{'all' if show_archived else 'active'}"):
         reports = load_reports()
         ensure_week_structure(reports, dev_week_iso, active)
         stored = reports[dev_week_iso].get("deviations", {})
@@ -1038,13 +1303,15 @@ with tab_deviations:
         reports[dev_week_iso]["deviations"] = stored
         save_reports(reports)
         mark_dirty("deviations saved")
-        st.success("Saved deviations.")
+        st.success("🎉 Deviations saved!")
+
 
 # =========================================================
 # TAB: WEEKLY REPORT
 # =========================================================
 with tab_report:
-    st.subheader("Weekly report")
+    st.subheader("📝 Weekly report")
+    st.caption("This is your ‘send-to-Jess’ view — designed to stand alone.")
 
     people_state = load_people_state()
     active = people_state["active"]
@@ -1066,17 +1333,17 @@ with tab_report:
     week_people_all = block.get("people", [])
     display_people = week_people_all if show_archived else [p for p in week_people_all if p in active_set]
 
-    st.caption(f"Selected week: **{week_label(rep_week)}**")
+    st.caption(f"🗓️ Selected week: **{week_label(rep_week)}**")
 
     if not display_people:
         st.info("No active people to show. Add/restore people in Baselines.")
         st.stop()
 
-    st.divider()
-    with st.expander("⚠️ Reset this week (danger zone)", expanded=False):
-        st.caption("Clears all saved numbers + TL actions for the selected week. (Does not delete uploads.)")
-        confirm = st.checkbox("I understand this will clear the week data", key=f"reset_confirm_{TEAM}_{rep_week_iso}")
-        if st.button("RESET week now", use_container_width=True, key=f"reset_week_{TEAM}_{rep_week_iso}", disabled=not confirm):
+    # Reset week
+    with st.expander("🧨 Reset this week (if things got messy)", expanded=False):
+        st.caption("This clears the numbers + TL actions for this week. It does NOT delete uploads.")
+        confirm = st.checkbox("Yes, reset this week", key=f"reset_confirm_{TEAM}_{rep_week_iso}")
+        if st.button("🧼 Reset week now", use_container_width=True, key=f"reset_week_{TEAM}_{rep_week_iso}", disabled=not confirm):
             reports = load_reports()
             ensure_week_structure(reports, rep_week_iso, active)
 
@@ -1090,10 +1357,11 @@ with tab_report:
 
             save_reports(reports)
             mark_dirty("week reset")
-            st.success("Week reset complete.")
+            st.success("✅ Week reset complete.")
             st.rerun()
 
-    st.write("Enter daily actuals. Baseline auto-fills from Baselines (you can override per week).")
+    st.divider()
+    st.write("👇 You can type values manually, or use **📥 Uploads → Extract data and apply** to fill these automatically.")
 
     for metric in METRICS:
         st.markdown(f"### {metric}")
@@ -1121,10 +1389,10 @@ with tab_report:
             hide_index=True,
             use_container_width=True,
             column_config={"Person": st.column_config.TextColumn(disabled=True)},
-            key=f"report_editor_{TEAM}_{rep_week_iso}_{metric}_{'all' if show_archived else 'active'}"
+            key=f"report_editor_{TEAM}_{rep_week_iso}_{metric}_{'all' if show_archived else 'active'}",
         )
 
-        if st.button(f"Save {metric}", use_container_width=True, key=f"save_metric_{TEAM}_{rep_week_iso}_{metric}_{'all' if show_archived else 'active'}"):
+        if st.button(f"✅ Save {metric}", use_container_width=True, key=f"save_metric_{TEAM}_{rep_week_iso}_{metric}_{'all' if show_archived else 'active'}"):
             reports = load_reports()
             ensure_week_structure(reports, rep_week_iso, active)
             stored = reports[rep_week_iso]["metrics"].get(metric, {})
@@ -1134,21 +1402,23 @@ with tab_report:
             reports[rep_week_iso]["metrics"][metric] = stored
             save_reports(reports)
             mark_dirty(f"{metric} saved")
-            st.success(f"Saved {metric}.")
+            st.success(f"🎉 Saved {metric}.")
             st.rerun()
 
         st.divider()
 
-    st.subheader("TL actions (required)")
+    st.subheader("🧭 TL actions (required)")
+    st.caption("Please write what you’ll do about performance — this is the accountability bit.")
+
     for p in display_people:
         st.text_area(
-            f"{p} — TL action (what will you do about it?)",
+            f"{p} — what will you do about it?",
             value=block.get("actions", {}).get(p, ""),
             height=90,
-            key=f"action_{TEAM}_{rep_week_iso}_{p}_{'all' if show_archived else 'active'}"
+            key=f"action_{TEAM}_{rep_week_iso}_{p}_{'all' if show_archived else 'active'}",
         )
 
-    if st.button("Save TL actions", use_container_width=True, key=f"save_actions_{TEAM}_{rep_week_iso}_{'all' if show_archived else 'active'}"):
+    if st.button("✅ Save TL actions", use_container_width=True, key=f"save_actions_{TEAM}_{rep_week_iso}_{'all' if show_archived else 'active'}"):
         reports = load_reports()
         ensure_week_structure(reports, rep_week_iso, active)
         for p in display_people:
@@ -1156,7 +1426,7 @@ with tab_report:
             reports[rep_week_iso]["actions"][p] = st.session_state.get(k, "")
         save_reports(reports)
         mark_dirty("TL actions saved")
-        st.success("Saved TL actions.")
+        st.success("🎉 TL actions saved!")
 
     st.divider()
 
@@ -1168,127 +1438,135 @@ with tab_report:
 
     status, issues = run_checks(block, display_people, active_set, baselines, rep_week_iso)
 
-    st.subheader("Readiness checks")
+    st.subheader("✅ Readiness checks")
     if status == "green":
-        st.success("✅ Ready to send. No issues found.")
+        st.success("🟢 Ready to send — nice.")
     elif status == "amber":
-        st.warning("🟠 Some items need attention before sending.")
+        st.warning("🟠 Nearly there — a few bits to tidy up.")
     else:
-        st.error("🔴 Not ready to send. Fix the red items first.")
+        st.error("🔴 Not ready yet — please fix the red items.")
 
     if issues:
-        st.markdown("**Issues:**")
+        st.markdown("**What needs attention:**")
         for it in issues:
             st.markdown(f"- {it}")
 
     st.divider()
 
-    st.subheader("✅ TL checklist (do this every week)")
-    if status != "green":
-        st.warning("Finish the missing items above until the report is GREEN. Then complete the checklist below.")
-    else:
-        st.success("Report is GREEN — now complete the export steps below.")
+    st.subheader("✅ Weekly checklist (2 minutes)")
+    st.markdown("**1)** Download the backup JSON and save it to the backup folder")
+    st.markdown(f"📁 [Open backup folder]({BACKUP_FOLDER_URL})")
+    st.markdown("**2)** Download the Weekly WIDE CSV and import into the tracker")
+    st.markdown(f"📊 [Open performance tracker]({TRACKER_SHEET_URL})")
 
     cA, cB = st.columns(2)
     with cA:
-        st.markdown("**1) Save backup JSON to the right folder**")
-        st.markdown(f"[Open backup folder]({BACKUP_FOLDER_URL})")
         cur_backup = build_team_backup(TEAM)
         st.download_button(
-            "Download CURRENT backup.json",
+            "💾 Download CURRENT backup.json",
             data=json.dumps(cur_backup, indent=2).encode("utf-8"),
             file_name=f"{TEAM.lower()}_backup.json",
             mime="application/json",
             use_container_width=True,
             disabled=(status != "green"),
-            key=f"dl_weekly_backup_{TEAM}_{rep_week_iso}"
+            key=f"dl_weekly_backup_{TEAM}_{rep_week_iso}",
         )
 
     with cB:
-        st.markdown("**2) Export Weekly WIDE CSV to the tracker**")
-        st.markdown(f"[Open performance tracker]({TRACKER_SHEET_URL})")
         st.download_button(
-            "Download Weekly WIDE CSV",
+            "📤 Download Weekly WIDE CSV",
             data=export_week_wide_csv(TEAM, rep_week_iso),
             file_name=f"{TEAM.lower()}_weekly_wide_{rep_week_iso}.csv",
             mime="text/csv",
             use_container_width=True,
             disabled=(status != "green"),
-            key=f"dl_weekly_wide_{TEAM}_{rep_week_iso}"
+            key=f"dl_weekly_wide_{TEAM}_{rep_week_iso}",
         )
 
     st.caption("Google Sheets import: File → Import → Upload → choose the CSV.")
+
+    if st.button("✅ Mark backup done (records timestamp)", use_container_width=True, disabled=(status != "green"), key=f"mark_backup_{TEAM}_{rep_week_iso}"):
+        m = load_meta()
+        m["last_backup_at"] = now_stamp()
+        save_meta(m)
+        clear_dirty()
+        st.success("✅ Nice — backup timestamp recorded.")
+        st.rerun()
+
     st.divider()
 
-    st.subheader("Report preview (copy/paste)")
-    st.caption("Tip: click inside → Ctrl+A → Ctrl+C.")
+    st.subheader("📋 Report preview (copy/paste)")
+    st.caption("Tip: click inside → Ctrl+A → Ctrl+C")
     st.text_area("Weekly report text", value=report_txt, height=520, key=f"preview_{TEAM}_{rep_week_iso}")
 
     st.divider()
-    st.subheader("Other downloads")
+    st.subheader("⬇️ Other downloads")
     st.download_button(
-        "Download weekly report (TXT)",
+        "📝 Download weekly report (TXT)",
         data=report_txt.encode("utf-8"),
         file_name=f"{TEAM.lower()}_weekly_report_{rep_week_iso}.txt",
         mime="text/plain",
-        use_container_width=True
+        use_container_width=True,
     )
     st.download_button(
-        "Download weekly data (TSV)",
+        "📎 Download weekly data (TSV)",
         data=report_tsv.encode("utf-8"),
         file_name=f"{TEAM.lower()}_weekly_data_{rep_week_iso}.tsv",
         mime="text/tab-separated-values",
-        use_container_width=True
+        use_container_width=True,
     )
+
 
 # =========================================================
 # TAB: BACKUP & EXPORT
 # =========================================================
 with tab_backup:
-    st.subheader("💾 Backup & Export (safe mode)")
-    st.markdown("**Use this weekly** (or after edits). Backups prevent data loss if Streamlit resets.")
+    st.subheader("💾 Backup & Export")
+    st.caption("This is your safety net. Use it weekly (or after big edits).")
 
     st.divider()
-    st.markdown("### Backup JSON (download)")
+    st.markdown("### 💾 Download backups")
 
     c1, c2, c3 = st.columns(3)
     with c1:
         b = build_team_backup("North")
         st.download_button(
-            "Download NORTH backup.json",
+            "⬇️ Download NORTH backup.json",
             data=json.dumps(b, indent=2).encode("utf-8"),
             file_name="north_backup.json",
             mime="application/json",
             use_container_width=True,
-            key="dl_backup_north"
+            key="dl_backup_north",
         )
     with c2:
         b = build_team_backup("South")
         st.download_button(
-            "Download SOUTH backup.json",
+            "⬇️ Download SOUTH backup.json",
             data=json.dumps(b, indent=2).encode("utf-8"),
             file_name="south_backup.json",
             mime="application/json",
             use_container_width=True,
-            key="dl_backup_south"
+            key="dl_backup_south",
         )
     with c3:
         b = build_team_backup(TEAM)
         st.download_button(
-            f"Download CURRENT ({TEAM}) backup.json",
+            f"⬇️ Download CURRENT ({TEAM}) backup.json",
             data=json.dumps(b, indent=2).encode("utf-8"),
             file_name=f"{TEAM.lower()}_backup.json",
             mime="application/json",
             use_container_width=True,
-            key="dl_backup_current"
+            key="dl_backup_current",
         )
 
+    st.info("📌 Backups include People, Baselines, Reports, and Upload metadata. Upload files themselves aren’t included.")
+
     st.divider()
-    st.markdown("### Restore from backup JSON (overwrites saved data)")
+    st.markdown("### ♻️ Restore from a backup")
     up = st.file_uploader("Upload backup JSON", type=["json"], key="restore_upload")
     target_team = st.radio("Restore into team", ["North", "South"], horizontal=True, key="restore_target_team")
 
-    if st.button("Restore NOW (overwrite)", use_container_width=True, key="restore_now_btn"):
+    if st.button("♻️ Restore NOW (overwrite)", use_container_width=True, key="restore_now_btn"):
         if not up:
             st.error("Upload a backup JSON first.")
         else:
@@ -1296,13 +1574,16 @@ with tab_backup:
                 data = json.loads(up.getvalue().decode("utf-8"))
                 restore_team_backup(data, target_team)
                 mark_dirty("restored from backup")
-                st.success(f"Restored backup into {target_team}.")
-                st.info("Switch team (sidebar) to view it.")
+                st.success(f"✅ Restored backup into {target_team}.")
+                st.info("Tip: use the sidebar to switch team and check it.")
             except Exception as e:
                 st.error(f"Restore failed: {e}")
 
     st.divider()
-    st.markdown("### Mark as backed up")
-    if st.button("I’ve backed up now", use_container_width=True, key="clear_dirty_btn"):
+    st.markdown("### 🧼 Clear backup reminder")
+    if st.button("✅ I’ve backed up now", use_container_width=True, key="clear_dirty_btn"):
         clear_dirty()
-        st.success("Backup reminder cleared.")
+        m = load_meta()
+        m["last_backup_at"] = now_stamp()
+        save_meta(m)
+        st.success("✅ Backup reminder cleared + timestamp recorded.")
