@@ -223,36 +223,37 @@ def extract_stacked_chart_to_monfri(
 
     ticks = sorted(ticks, key=lambda x: x[0])
     if len(ticks) < 5:
+        # Make sure this return is indented correctly
         return {}, {"error": f"I couldn’t detect 5 date ticks (found {len(ticks)}). Try a less cropped screenshot."}
 
     ticks = ticks[:5]
     tick_x = [t[0] for t in ticks]
 
     # ---- Legend mapping
-   # ---- Legend mapping
-legend = {}  # person -> sampled colour (BGR)
-for bbox, text, conf in ocr:
-    t = str(text).strip()
-    if conf < 0.35 or len(t) < 3:
-        continue
+    legend = {}  # person -> sampled colour (BGR)
+    for bbox, text, conf in ocr:
+        t = str(text).strip()
+        if conf < 0.35 or len(t) < 3:
+            continue
 
-    match = process.extractOne(t, known_people, scorer=fuzz.partial_ratio)
-    if not match:
-        continue
-    person, score, _ = match
-    if score < 80:
-        continue
+        match = process.extractOne(t, known_people, scorer=fuzz.partial_ratio)
+        if not match:
+            continue
+        person, score, _ = match
+        if score < 80:
+            continue
 
-    xs = [p[0] for p in bbox]
-    ys = [p[1] for p in bbox]
-    left = int(min(xs))
-    cy = int(sum(ys) / 4)
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+        left = int(min(xs))
+        cy = int(sum(ys) / 4)
 
-    sample_x = max(0, left - 18)
-    color = _avg_color(img_bgr, sample_x, cy, r=8)
-    legend[person] = color
+        sample_x = max(0, left - 18)
+        color = _avg_color(img_bgr, sample_x, cy, r=8)
+        legend[person] = color
 
     if not legend:
+        # Make sure this return is indented correctly
         return {}, {"error": "I couldn’t match any legend names. Make sure the chart legend matches your People list."}
 
     # ---- Numeric labels
